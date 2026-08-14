@@ -31,7 +31,10 @@ RUN git clone --depth 1 --branch "${YOUTRACK_MCP_VERSION}" https://github.com/se
 # youtrack-mcp v0.1.4 ships with rmcp 1.7, which only supports the legacy
 # initialize lifecycle. ChatGPT tunnel discovery uses MCP 2026-07-28 and sends
 # server/discover first. rmcp 3.0.1 adds the 2026-07-28 stateless lifecycle.
+# RMCP 3 also renamed the MCP content union from Content to ContentBlock.
 RUN sed -i "s/rmcp = { version = \"1.7\"/rmcp = { version = \"${RMCP_VERSION}\"/" Cargo.toml \
+    && sed -i 's/CallToolResult, Content/CallToolResult, ContentBlock/' src/server.rs \
+    && sed -i 's/Content::/ContentBlock::/g' src/server.rs \
     && rm -f Cargo.lock \
     && cargo build --release
 
