@@ -1,0 +1,22 @@
+services:
+  youtrack-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TUNNEL_CLIENT_VERSION: ${TUNNEL_CLIENT_VERSION:-v0.0.10}
+    restart: unless-stopped
+    environment:
+      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY}
+      CONTROL_PLANE_TUNNEL_ID: ${CONTROL_PLANE_TUNNEL_ID}
+      MCP_COMMAND: "npx -y mcp-bin sensiarion/youtrack-mcp"
+      YOUTRACK_URL: ${YOUTRACK_URL}
+      YOUTRACK_TOKEN: ${YOUTRACK_TOKEN}
+      MCP_BIN_DIR: /data/mcp-bin
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    volumes:
+      - mcp-bin-cache:/data/mcp-bin
+
+volumes:
+  mcp-bin-cache:
