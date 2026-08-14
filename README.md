@@ -2,6 +2,8 @@
 
 Runs `sensiarion/youtrack-mcp` through OpenAI Secure MCP Tunnel so it can be used from ChatGPT web.
 
+The upstream `youtrack-mcp v0.1.4` release still uses `rmcp 1.7`, which expects the legacy MCP `initialize` lifecycle. ChatGPT tunnel discovery sends `server/discover` using MCP `2026-07-28`, so this image rebuilds `youtrack-mcp v0.1.4` against `rmcp 3.0.1`.
+
 ## Dokploy setup
 
 1. Create a **Project** in Dokploy.
@@ -21,10 +23,17 @@ YOUTRACK_URL=https://my-items.youtrack.cloud
 YOUTRACK_TOKEN=perm-replace-me
 ```
 
-Optional:
+Optional version pins:
 
 ```env
 TUNNEL_CLIENT_VERSION=v0.0.10
+YOUTRACK_MCP_VERSION=v0.1.4
+RMCP_VERSION=3.0.1
+```
+
+Optional logging:
+
+```env
 LOG_LEVEL=info
 LOG_FORMAT=json
 ```
@@ -33,15 +42,15 @@ Never commit the real `CONTROL_PLANE_API_KEY` or `YOUTRACK_TOKEN`.
 
 ## MCP command
 
-The container runs the equivalent of:
+The container runs:
 
 ```bash
-npx -y mcp-bin sensiarion/youtrack-mcp
+/usr/local/bin/youtrack-mcp
 ```
 
 with `YOUTRACK_URL` and `YOUTRACK_TOKEN` passed to the MCP server.
 
-`mcp-bin` requires Node.js 22+ and caches the downloaded YouTrack MCP binary in `/data/mcp-bin`. The Compose service persists that directory in a Docker volume.
+The binary is built during the Docker image build from the pinned upstream `youtrack-mcp` release, with its `rmcp` dependency upgraded to the pinned compatible version.
 
 ## OpenAI tunnel
 
@@ -62,14 +71,25 @@ After the Dokploy deployment is running:
 2. Create a developer-mode app/plugin.
 3. Choose **Tunnel** as the connection type.
 4. Select the tunnel corresponding to `CONTROL_PLANE_TUNNEL_ID`.
-5. Let ChatGPT discover the YouTrack MCP tools.
+5. Scan/discover the YouTrack MCP tools.
 
-## Updating the YouTrack MCP
+## Health checks
 
-`mcp-bin` caches the resolved binary. To force it to resolve the newest release again, execute inside the running container:
+Inside the running Dokploy container:
 
 ```bash
-npx -y mcp-bin expire sensiarion/youtrack-mcp
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8080/readyz
 ```
 
-Then restart/redeploy the service.
+Expected responses are `live` and `ready`.
+
+To inspect the tunnel/MCP state:
+
+```bash
+curl -fsS http://127.0.0.1:8080/api/status
+```
+
+## Updating
+
+Check the latest stable releases first, then change the version pins in `docker-compose.yml` / `.env` and redeploy. The Docker image is rebuilt from source, so there is no persistent `mcp-bin` cache to clear.
