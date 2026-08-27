@@ -48,7 +48,10 @@ fn req<'a>(v: &'a Option<String>, msg: &str) -> Result<&'a str, ErrorData> {
 
 fn attachment_tool_meta() -> rmcp::model::MetaObject {
     let mut meta = rmcp::model::MetaObject::new();
-    meta.insert("openai/fileParams".into(), serde_json::json!(["file"]));
+    meta.insert(
+        "openai/fileParams".into(),
+        serde_json::json!(["file", "path"]),
+    );
     meta
 }
 
@@ -278,7 +281,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Attachments of an issue (default) or article: op list|get|upload|download|delete. Target by 'attachmentId' or by 'name' (an ambiguous name errors with the candidate ids). For uploads, pass the user-provided ChatGPT file in 'file'; contentBase64 and server-local path remain supported. Download: an image is returned as a viewable image; anything else is written to disk ('path', else YOUTRACK_DOWNLOAD_DIR, else temp) and the path returned — read it with the file-reading tool.",
+        description = "Attachments of an issue (default) or article: op list|get|upload|download|delete. Target by 'attachmentId' or by 'name' (an ambiguous name errors with the candidate ids). For uploads, pass the user-provided file in 'path' so ChatGPT can mount it without changing its bytes; 'file' references and contentBase64 remain supported. Download: an image is returned as a viewable image; anything else is written to disk ('path', else YOUTRACK_DOWNLOAD_DIR, else temp) and the path returned — read it with the file-reading tool.",
         meta = attachment_tool_meta()
     )]
     async fn attachment(
@@ -460,9 +463,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attachment_declares_chatgpt_file_parameter() {
+    fn attachment_declares_chatgpt_file_parameters() {
         let tool = serde_json::to_value(Server::attachment_tool_attr()).unwrap();
-        assert_eq!(tool["_meta"]["openai/fileParams"], serde_json::json!(["file"]));
+        assert_eq!(
+            tool["_meta"]["openai/fileParams"],
+            serde_json::json!(["file", "path"])
+        );
 
         let schema = &tool["inputSchema"];
         assert!(schema["properties"]["file"].is_object());

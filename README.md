@@ -4,7 +4,7 @@ Runs `sensiarion/youtrack-mcp` through OpenAI Secure MCP Tunnel so it can be use
 
 The `youtrack-mcp/` directory contains the upstream `youtrack-mcp v0.1.4` source with this deployment's compatibility changes applied directly. It uses RMCP 3 for ChatGPT tunnel discovery and accepts ChatGPT file references for attachment uploads.
 
-Files attached to a conversation are passed as authorized temporary download URLs and uploaded directly to YouTrack; server-local paths and base64 remain supported for other MCP clients.
+For unchanged uploads, ChatGPT mounts the conversation file and rewrites the attachment tool's declared `path` file parameter. Authorized temporary file references and base64 remain supported for other MCP clients.
 
 ## Dokploy setup
 

@@ -32,7 +32,7 @@ A drop-in replacement for heavier YouTrack MCPs:
 | `activity` | Activity feed. `scope=issue` (needs `issueId`, optional author) \| `user` (needs author, defaults last 30d). Categories default to CustomFieldCategory, CommentsCategory. Dates ISO or unix ms. |
 | `users` | Users: `op` list (optional query) \| me \| get (by id). |
 | `meta` | Discovery: `kind` projects \| link_types \| work_item_types (optional project). |
-| `attachment` | Attachments of an issue (`entity` defaults to `issue`) or article: `op` list \| get \| upload \| download \| delete. Target by `attachmentId` or `name`. Upload via a ChatGPT `file` reference, `contentBase64`, or server-local `path`. Download hands back an image as a viewable image; anything else is written to disk and the path returned. |
+| `attachment` | Attachments of an issue (`entity` defaults to `issue`) or article: `op` list \| get \| upload \| download \| delete. Target by `attachmentId` or `name`. Upload unchanged ChatGPT files through the declared `path` file parameter; `file` references and `contentBase64` are also supported. Download hands back an image as a viewable image; anything else is written to disk and the path returned. |
 
 ---
 
