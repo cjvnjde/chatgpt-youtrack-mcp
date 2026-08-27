@@ -2,7 +2,9 @@
 
 Runs `sensiarion/youtrack-mcp` through OpenAI Secure MCP Tunnel so it can be used from ChatGPT web.
 
-The upstream `youtrack-mcp v0.1.4` release still uses `rmcp 1.7`, which expects the legacy MCP `initialize` lifecycle. ChatGPT tunnel discovery sends `server/discover` using MCP `2026-07-28`, so this image rebuilds `youtrack-mcp v0.1.4` against `rmcp 3.0.1`.
+The `youtrack-mcp/` directory contains the upstream `youtrack-mcp v0.1.4` source with this deployment's compatibility changes applied directly. It uses RMCP 3 for ChatGPT tunnel discovery and accepts ChatGPT file references for attachment uploads.
+
+Files attached to a conversation are passed as authorized temporary download URLs and uploaded directly to YouTrack; server-local paths and base64 remain supported for other MCP clients.
 
 ## Dokploy setup
 
@@ -23,12 +25,10 @@ YOUTRACK_URL=https://my-items.youtrack.cloud
 YOUTRACK_TOKEN=perm-replace-me
 ```
 
-Optional version pins:
+Optional tunnel client version pin:
 
 ```env
 TUNNEL_CLIENT_VERSION=v0.0.10
-YOUTRACK_MCP_VERSION=v0.1.4
-RMCP_VERSION=3.0.1
 ```
 
 Optional logging:
@@ -50,7 +50,7 @@ The container runs:
 
 with `YOUTRACK_URL` and `YOUTRACK_TOKEN` passed to the MCP server.
 
-The binary is built during the Docker image build from the pinned upstream `youtrack-mcp` release, with its `rmcp` dependency upgraded to the pinned compatible version.
+The binary is built directly from the checked-in `youtrack-mcp/` source during the Docker image build.
 
 ## OpenAI tunnel
 
@@ -92,4 +92,4 @@ curl -fsS http://127.0.0.1:8080/api/status
 
 ## Updating
 
-Check the latest stable releases first, then change the version pins in `docker-compose.yml` / `.env` and redeploy. The Docker image is rebuilt from source, so there is no persistent `mcp-bin` cache to clear.
+Update the checked-in source under `youtrack-mcp/`, run its tests, and redeploy. To update the tunnel client, change `TUNNEL_CLIENT_VERSION` in `docker-compose.yml` / `.env`. The Docker image is rebuilt from source, so there is no persistent `mcp-bin` cache to clear.

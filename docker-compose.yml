@@ -5,8 +5,6 @@ services:
       dockerfile: Dockerfile
       args:
         TUNNEL_CLIENT_VERSION: ${TUNNEL_CLIENT_VERSION:-v0.0.10}
-        YOUTRACK_MCP_VERSION: ${YOUTRACK_MCP_VERSION:-v0.1.4}
-        RMCP_VERSION: ${RMCP_VERSION:-3.0.1}
     restart: unless-stopped
     environment:
       CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY}
