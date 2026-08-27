@@ -46,12 +46,9 @@ fn req<'a>(v: &'a Option<String>, msg: &str) -> Result<&'a str, ErrorData> {
         .ok_or_else(|| ErrorData::invalid_params(msg.to_string(), None))
 }
 
-fn attachment_tool_meta() -> rmcp::model::MetaObject {
+fn file_upload_tool_meta() -> rmcp::model::MetaObject {
     let mut meta = rmcp::model::MetaObject::new();
-    meta.insert(
-        "openai/fileParams".into(),
-        serde_json::json!(["file", "path"]),
-    );
+    meta.insert("openai/fileParams".into(), serde_json::json!(["file"]));
     meta
 }
 
@@ -281,9 +278,32 @@ impl Server {
     }
 
     #[tool(
-        description = "Attachments of an issue (default) or article: op list|get|upload|download|delete. Target by 'attachmentId' or by 'name' (an ambiguous name errors with the candidate ids). For uploads, pass the user-provided file in 'path' so ChatGPT can mount it without changing its bytes; 'file' references and contentBase64 remain supported. Download: an image is returned as a viewable image; anything else is written to disk ('path', else YOUTRACK_DOWNLOAD_DIR, else temp) and the path returned — read it with the file-reading tool.",
-        meta = attachment_tool_meta()
+        description = "Upload a user-provided ChatGPT file unchanged to an issue (default) or article. Pass the attached file in 'file', never as a /mnt/data path or base64. ChatGPT replaces its internal file reference with an authorized temporary download URL before calling this tool.",
+        meta = file_upload_tool_meta()
     )]
+    async fn attachment_upload(
+        &self,
+        Parameters(a): Parameters<AttachmentUploadArg>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entity = a.entity.unwrap_or(Entity::Issue);
+        let name = a.name.as_deref().or(a.file.file_name.as_deref()).ok_or_else(|| {
+            ErrorData::invalid_params(
+                "attachment_upload requires 'name' when the file has no file_name",
+                None,
+            )
+        })?;
+        let bytes = fetch_openai_file(&a.file).await?;
+        let mut v = self
+            .yt
+            .attachment_upload(entity, &a.parent_id, name, bytes)
+            .await?;
+        if !a.verbose.unwrap_or(false) {
+            strip_url(&mut v);
+        }
+        ok_result(v)
+    }
+
+    #[tool(description = "List, inspect, download, delete, or perform a legacy upload of attachments on an issue (default) or article: op list|get|upload|download|delete. Use attachment_upload—not this tool—for files attached in ChatGPT. Target get/download/delete by 'attachmentId' or 'name'. Legacy upload accepts contentBase64 or a path local to the MCP server; a ChatGPT /mnt/data path is not local to this server.")]
     async fn attachment(
         &self,
         Parameters(a): Parameters<AttachmentArg>,
@@ -303,31 +323,20 @@ impl Server {
                 v
             }
             AttachOp::Upload => {
-                let (name, bytes) = if let Some(file) = &a.file {
-                    let name = a.name.as_deref().or(file.file_name.as_deref()).ok_or_else(|| {
-                        ErrorData::invalid_params(
-                            "attachment op=upload requires 'name' when the file has no file_name",
-                            None,
-                        )
-                    })?;
-                    (name.to_string(), fetch_openai_file(file).await?)
+                let name = req(&a.name, "attachment op=upload requires 'name'")?;
+                let bytes = if let Some(b64) = &a.content_base64 {
+                    YouTrack::b64_decode(b64).map_err(ErrorData::from)?
+                } else if let Some(p) = &a.path {
+                    tokio::fs::read(p)
+                        .await
+                        .map_err(|e| ErrorData::invalid_params(format!("read {p}: {e}"), None))?
                 } else {
-                    let name = req(&a.name, "attachment op=upload requires 'name'")?.to_string();
-                    let bytes = if let Some(b64) = &a.content_base64 {
-                        YouTrack::b64_decode(b64).map_err(ErrorData::from)?
-                    } else if let Some(p) = &a.path {
-                        tokio::fs::read(p).await.map_err(|e| {
-                            ErrorData::invalid_params(format!("read {p}: {e}"), None)
-                        })?
-                    } else {
-                        return Err(ErrorData::invalid_params(
-                            "file, contentBase64 or path required",
-                            None,
-                        ));
-                    };
-                    (name, bytes)
+                    return Err(ErrorData::invalid_params(
+                        "contentBase64 or server-local path required; use attachment_upload for a ChatGPT file",
+                        None,
+                    ));
                 };
-                let mut v = self.yt.attachment_upload(entity, parent, &name, bytes).await?;
+                let mut v = self.yt.attachment_upload(entity, parent, name, bytes).await?;
                 if !verbose {
                     strip_url(&mut v);
                 }
@@ -463,15 +472,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attachment_declares_chatgpt_file_parameters() {
-        let tool = serde_json::to_value(Server::attachment_tool_attr()).unwrap();
-        assert_eq!(
-            tool["_meta"]["openai/fileParams"],
-            serde_json::json!(["file", "path"])
-        );
+    fn attachment_upload_declares_required_chatgpt_file_parameter() {
+        let tool = serde_json::to_value(Server::attachment_upload_tool_attr()).unwrap();
+        assert_eq!(tool["_meta"]["openai/fileParams"], serde_json::json!(["file"]));
 
         let schema = &tool["inputSchema"];
-        assert!(schema["properties"]["file"].is_object());
+        assert!(schema["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|field| field == "file")));
+        assert!(schema["properties"]["path"].is_null());
         let file_schema = &schema["$defs"]["OpenAiFile"];
         assert_eq!(
             file_schema["required"],
@@ -481,6 +490,39 @@ mod tests {
         for field in ["download_url", "file_id", "mime_type", "file_name"] {
             assert!(file_schema["properties"][field].is_object());
         }
+    }
+
+    #[tokio::test]
+    async fn chatgpt_file_download_preserves_exact_bytes() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff];
+        let response_body = expected.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            )
+            .unwrap();
+            stream.write_all(&response_body).unwrap();
+        });
+        let file = OpenAiFile {
+            download_url: format!("http://{address}/original.png"),
+            file_id: "file_test".into(),
+            mime_type: Some("image/png".into()),
+            file_name: Some("original.png".into()),
+        };
+
+        let actual = fetch_openai_file(&file).await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

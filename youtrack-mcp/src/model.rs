@@ -331,6 +331,24 @@ pub struct OpenAiFile {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct AttachmentUploadArg {
+    /// Which entity owns the attachment. Defaults to `issue`.
+    #[serde(default)]
+    pub entity: Option<Entity>,
+    /// Issue or article id (bare number expanded via default project).
+    #[serde(rename = "parentId", alias = "issueId")]
+    pub parent_id: String,
+    /// User-provided file authorized by ChatGPT for this tool call.
+    pub file: OpenAiFile,
+    /// Override the uploaded file name when `file_name` is unavailable or unsuitable.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Include the signed YouTrack `url` in the response. Off by default.
+    #[serde(default)]
+    pub verbose: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AttachmentArg {
     pub op: AttachOp,
     /// Which entity owns the attachment. Defaults to `issue`.
@@ -346,9 +364,6 @@ pub struct AttachmentArg {
     /// resolved to an id — an ambiguous name errors with the candidate ids.
     #[serde(default)]
     pub name: Option<String>,
-    /// A file supplied by ChatGPT. Its temporary URL is fetched during this call.
-    #[serde(default)]
-    pub file: Option<OpenAiFile>,
     #[serde(default, rename = "contentBase64")]
     pub content_base64: Option<String>,
     /// Local source for upload, or target for download.

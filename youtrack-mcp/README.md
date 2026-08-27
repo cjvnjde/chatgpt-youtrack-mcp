@@ -6,14 +6,14 @@ Lean [Model Context Protocol](https://modelcontextprotocol.io) server for [YouTr
 
 A drop-in replacement for heavier YouTrack MCPs:
 
-- **~10× smaller tool schema** — 16 consolidated tools (~3.2k tokens in `tools/list`) instead of 50+ (~23k tokens). Less context burned on every request.
+- **~10× smaller tool schema** — 17 focused and consolidated tools instead of 50+. Less context burned on every request.
 - **Correct subtask hierarchy** — parent set reliably via the command API; the real parent issue is surfaced (not an opaque link id).
 - **Complete write surface** — tags, agile board/sprint, work-item type for time tracking, attachments, article + comment create/edit, issue delete.
 - **Safe by design** — never creates tags (only applies existing ones); secrets never leak into error messages.
 
 ## Tools
 
-16 consolidated tools. Each takes an `op`/`kind` discriminator where it covers several operations.
+17 tools. Each takes an `op`/`kind` discriminator where it covers several operations.
 
 | Tool | What it does |
 |---|---|
@@ -32,7 +32,8 @@ A drop-in replacement for heavier YouTrack MCPs:
 | `activity` | Activity feed. `scope=issue` (needs `issueId`, optional author) \| `user` (needs author, defaults last 30d). Categories default to CustomFieldCategory, CommentsCategory. Dates ISO or unix ms. |
 | `users` | Users: `op` list (optional query) \| me \| get (by id). |
 | `meta` | Discovery: `kind` projects \| link_types \| work_item_types (optional project). |
-| `attachment` | Attachments of an issue (`entity` defaults to `issue`) or article: `op` list \| get \| upload \| download \| delete. Target by `attachmentId` or `name`. Upload unchanged ChatGPT files through the declared `path` file parameter; `file` references and `contentBase64` are also supported. Download hands back an image as a viewable image; anything else is written to disk and the path returned. |
+| `attachment_upload` | Upload a user-provided ChatGPT file unchanged to an issue or article through a required `file` parameter. ChatGPT supplies an authorized temporary URL; the server forwards the downloaded bytes without image processing. |
+| `attachment` | List, inspect, download, delete, or perform a legacy upload of issue/article attachments. Target by `attachmentId` or `name`. Legacy upload accepts `contentBase64` or a server-local `path`; ChatGPT composer files should use `attachment_upload`. |
 
 ---
 

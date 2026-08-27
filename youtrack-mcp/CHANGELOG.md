@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added `attachment_upload`, a dedicated ChatGPT file-input tool that downloads
+  the authorized temporary URL and forwards the exact bytes to YouTrack.
+- Kept `attachment op=upload` for base64 and paths local to the MCP server.
+
 ## 0.1.4
 
 Attachments are usable from an agent now. Plus a paging bug that ran through the
