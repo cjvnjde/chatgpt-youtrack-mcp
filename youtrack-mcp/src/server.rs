@@ -303,7 +303,7 @@ impl Server {
         ok_result(v)
     }
 
-    #[tool(description = "List, inspect, download, delete, or perform a legacy upload of attachments on an issue (default) or article: op list|get|upload|download|delete. Use attachment_upload—not this tool—for files attached in ChatGPT. Target get/download/delete by 'attachmentId' or 'name'. Legacy upload accepts contentBase64 or a path local to the MCP server; a ChatGPT /mnt/data path is not local to this server.")]
+    #[tool(description = "List, inspect, download, or delete attachments on an issue (default) or article: op list|get|download|delete. This tool cannot upload; use attachment_upload for every upload. Target get/download/delete by 'attachmentId' or 'name'.")]
     async fn attachment(
         &self,
         Parameters(a): Parameters<AttachmentArg>,
@@ -317,26 +317,6 @@ impl Server {
             AttachOp::Get => {
                 let r = self.resolve(entity, parent, &a, top).await?;
                 let mut v = self.yt.attachment_meta(entity, parent, r).await?;
-                if !verbose {
-                    strip_url(&mut v);
-                }
-                v
-            }
-            AttachOp::Upload => {
-                let name = req(&a.name, "attachment op=upload requires 'name'")?;
-                let bytes = if let Some(b64) = &a.content_base64 {
-                    YouTrack::b64_decode(b64).map_err(ErrorData::from)?
-                } else if let Some(p) = &a.path {
-                    tokio::fs::read(p)
-                        .await
-                        .map_err(|e| ErrorData::invalid_params(format!("read {p}: {e}"), None))?
-                } else {
-                    return Err(ErrorData::invalid_params(
-                        "contentBase64 or server-local path required; use attachment_upload for a ChatGPT file",
-                        None,
-                    ));
-                };
-                let mut v = self.yt.attachment_upload(entity, parent, name, bytes).await?;
                 if !verbose {
                     strip_url(&mut v);
                 }
@@ -490,6 +470,18 @@ mod tests {
         for field in ["download_url", "file_id", "mime_type", "file_name"] {
             assert!(file_schema["properties"][field].is_object());
         }
+    }
+
+    #[test]
+    fn attachment_tool_rejects_upload() {
+        let args = serde_json::json!({
+            "op": "upload",
+            "parentId": "MI-1427",
+            "path": "/mnt/data/original.png",
+            "name": "original.png"
+        });
+
+        assert!(serde_json::from_value::<AttachmentArg>(args).is_err());
     }
 
     #[tokio::test]

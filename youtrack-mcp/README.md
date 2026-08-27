@@ -33,7 +33,7 @@ A drop-in replacement for heavier YouTrack MCPs:
 | `users` | Users: `op` list (optional query) \| me \| get (by id). |
 | `meta` | Discovery: `kind` projects \| link_types \| work_item_types (optional project). |
 | `attachment_upload` | Upload a user-provided ChatGPT file unchanged to an issue or article through a required `file` parameter. ChatGPT supplies an authorized temporary URL; the server forwards the downloaded bytes without image processing. |
-| `attachment` | List, inspect, download, delete, or perform a legacy upload of issue/article attachments. Target by `attachmentId` or `name`. Legacy upload accepts `contentBase64` or a server-local `path`; ChatGPT composer files should use `attachment_upload`. |
+| `attachment` | List, inspect, download, or delete issue/article attachments. Target by `attachmentId` or `name`. All uploads use `attachment_upload`. |
 
 ---
 

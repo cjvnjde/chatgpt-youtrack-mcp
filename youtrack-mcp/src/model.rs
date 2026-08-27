@@ -299,7 +299,6 @@ pub struct ActivityArg {
 pub enum AttachOp {
     List,
     Get,
-    Upload,
     Download,
     Delete,
 }
@@ -310,7 +309,6 @@ impl AttachOp {
         match self {
             Self::List => "list",
             Self::Get => "get",
-            Self::Upload => "upload",
             Self::Download => "download",
             Self::Delete => "delete",
         }
@@ -364,9 +362,7 @@ pub struct AttachmentArg {
     /// resolved to an id — an ambiguous name errors with the candidate ids.
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default, rename = "contentBase64")]
-    pub content_base64: Option<String>,
-    /// Local source for upload, or target for download.
+    /// Local target for download.
     #[serde(default)]
     pub path: Option<String>,
     /// op=list page size. Default 500.

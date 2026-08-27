@@ -4,7 +4,8 @@
 
 - Added `attachment_upload`, a dedicated ChatGPT file-input tool that downloads
   the authorized temporary URL and forwards the exact bytes to YouTrack.
-- Kept `attachment op=upload` for base64 and paths local to the MCP server.
+- Removed `attachment op=upload` so ChatGPT cannot select the server-local
+  `path` flow for a composer upload.
 
 ## 0.1.4
 
