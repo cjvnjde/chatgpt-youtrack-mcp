@@ -1,6 +1,6 @@
 [package]
 name = "youtrack-mcp"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Lean YouTrack MCP server with compact tools, correct subtask hierarchy, tags, board/sprint, work-item types, and attachments."

@@ -453,6 +453,9 @@ mod tests {
 
     #[test]
     fn attachment_upload_declares_required_chatgpt_file_parameter() {
+        let tools = Server::tool_router().list_all();
+        assert!(tools.iter().any(|tool| tool.name == "attachment_upload"));
+
         let tool = serde_json::to_value(Server::attachment_upload_tool_attr()).unwrap();
         assert_eq!(tool["_meta"]["openai/fileParams"], serde_json::json!(["file"]));
 
@@ -474,6 +477,12 @@ mod tests {
 
     #[test]
     fn attachment_tool_rejects_upload() {
+        let tool = serde_json::to_value(Server::attachment_tool_attr()).unwrap();
+        assert_eq!(
+            tool["inputSchema"]["$defs"]["AttachOp"]["enum"],
+            serde_json::json!(["list", "get", "download", "delete"])
+        );
+
         let args = serde_json::json!({
             "op": "upload",
             "parentId": "MI-1427",

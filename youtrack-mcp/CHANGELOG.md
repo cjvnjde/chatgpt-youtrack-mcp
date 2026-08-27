@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - Added `attachment_upload`, a dedicated ChatGPT file-input tool that downloads
   the authorized temporary URL and forwards the exact bytes to YouTrack.

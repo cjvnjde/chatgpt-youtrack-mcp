@@ -22,6 +22,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting youtrack-mcp");
+
     let cfg = Config::from_env()?;
     let yt = YouTrack::new(cfg)?;
     let service = Server::new(yt).serve(stdio()).await?;
