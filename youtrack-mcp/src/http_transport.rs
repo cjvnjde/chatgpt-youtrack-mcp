@@ -109,6 +109,16 @@ fn with_auth(router: Router, token: Option<BearerToken>) -> Router {
     ))
 }
 
+fn streamable_config(cancellation: CancellationToken) -> StreamableHttpServerConfig {
+    // RMCP defaults to loopback-only Host values. These listeners sit behind
+    // Docker DNS and reverse proxies, so their legitimate Host headers are
+    // deployment-specific. The public listener is protected by bearer auth;
+    // the internal listener is protected by network isolation.
+    StreamableHttpServerConfig::default()
+        .with_cancellation_token(cancellation)
+        .disable_allowed_hosts()
+}
+
 fn mcp_app(
     server: Server,
     cancellation: CancellationToken,
@@ -119,7 +129,7 @@ fn mcp_app(
     let service = StreamableHttpService::new(
         move || Ok(factory_server.clone()),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default().with_cancellation_token(cancellation),
+        streamable_config(cancellation),
     );
     let mcp = with_auth(Router::new().nest_service("/mcp", service), token);
     if health_routes {
@@ -248,6 +258,13 @@ mod tests {
         assert!(BearerToken::new("short".into()).is_err());
         assert!(BearerToken::new(format!("{TOKEN} suffix")).is_err());
         assert!(BearerToken::new(TOKEN.into()).is_ok());
+    }
+
+    #[test]
+    fn accepts_docker_and_reverse_proxy_host_headers() {
+        let config = streamable_config(CancellationToken::new());
+
+        assert!(config.allowed_hosts.is_empty());
     }
 
     #[tokio::test]

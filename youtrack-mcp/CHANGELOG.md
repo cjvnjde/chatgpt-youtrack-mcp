@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed HTTP `403 Forbidden` responses for Docker service names and
+  reverse-proxy domains; RMCP's loopback-only default Host allowlist is
+  disabled because bearer authentication and private-network isolation are the
+  listener boundaries.
 - Added MCP Streamable HTTP transport for shared deployments. Public
   `MCP_HTTP_ADDR` requests require a 32+ byte `MCP_AUTH_TOKEN`; optional
   `MCP_INTERNAL_ADDR` provides a separate unauthenticated listener for a
