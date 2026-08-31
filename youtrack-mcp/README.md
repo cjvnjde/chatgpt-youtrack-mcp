@@ -26,6 +26,9 @@ A complete, typed YouTrack API surface with focused high-level workflows:
 The server keeps 17 curated workflow tools and adds one `api_*` tool for every
 operation advertised by the connected YouTrack instance. The exact total
 therefore follows the server version and installed features.
+Generated input schemas are included directly in MCP discovery. Use
+`api_schema` with a generated tool name when its full OpenAPI output schema is
+needed.
 
 ### Curated workflow tools
 
@@ -58,8 +61,12 @@ authoritative OpenAPI schema. Every HTTP operation is registered as an MCP tool:
   `api_get_admin_projects`. Path placeholders become name segments.
 - Path, query, header and cookie parameters are top-level tool arguments.
   Request payloads use the `body` argument.
-- Input and output JSON Schemas preserve OpenAPI objects, required fields,
-  arrays, enums, nullable fields, descriptions and referenced models.
+- Input JSON Schemas preserve OpenAPI objects, required fields, arrays, enums,
+  nullable fields, descriptions and referenced models.
+  Output schemas preserve the same information and are returned per operation
+  by `api_schema`; they are not repeated in `tools/list`. This keeps the tool
+  catalog below infrastructure limits such as Cosmos DB's 2 MiB item limit
+  without removing any API operation.
 - JSON, form, multipart, text and base64-encoded binary request bodies are
   supported. JSON, text and binary responses return structured status,
   content-type and body data.

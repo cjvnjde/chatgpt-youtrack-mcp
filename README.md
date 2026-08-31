@@ -17,6 +17,9 @@ Caddy or Nginx terminates public TLS for direct agents.
 The checked-in `youtrack-mcp/` source provides 17 curated workflow tools plus a
 typed `api_*` tool for every operation advertised by the connected YouTrack
 instance.
+Generated tools keep their typed inputs in discovery; call `api_schema` for one
+operation's full output schema. Serving output contracts on demand keeps the
+tool catalog below Cosmos DB's 2 MiB item limit without removing API coverage.
 
 ## Required environment variables
 

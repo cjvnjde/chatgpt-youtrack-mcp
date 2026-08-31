@@ -181,6 +181,13 @@ pub struct IdArg {
     pub id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApiSchemaArg {
+    /// Generated API tool name, for example api_post_issues.
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchFields {

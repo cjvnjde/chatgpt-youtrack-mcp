@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed MCP discovery exceeding Cosmos DB's 2 MiB item limit. Generated API
+  output schemas are now returned on demand by `api_schema` instead of being
+  duplicated in `tools/list`; all operations and typed input schemas remain
+  available.
 - Fixed HTTP `403 Forbidden` responses for Docker service names and
   reverse-proxy domains; RMCP's loopback-only default Host allowlist is
   disabled because bearer authentication and private-network isolation are the
@@ -14,8 +18,9 @@
   container orchestration.
 - Added a complete typed MCP mirror of the connected YouTrack API. At startup,
   every operation in `/api/openapi.json` is registered as an `api_*` tool with
-  typed parameters, request body and response schema; JSON, form, multipart,
-  text and binary bodies are supported.
+  typed parameters and request bodies; full response schemas are available
+  through `api_schema`. JSON, form, multipart, text and binary bodies are
+  supported.
 - Added `YOUTRACK_OPENAPI_PATH` for offline or pinned OpenAPI schemas.
 - `issue_write.assignee` now distinguishes omission from `null`; explicit `null`
   clears the current assignee.

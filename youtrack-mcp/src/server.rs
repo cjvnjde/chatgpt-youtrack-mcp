@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use crate::youtrack::{strip_url, Resolved, YouTrack, LIST_TOP};
 pub struct Server {
     yt: Arc<YouTrack>,
     router: ToolRouter<Self>,
+    api_output_schemas: Arc<HashMap<String, Value>>,
 }
 
 /// Drop `$type` discriminator keys YouTrack stamps on every object — pure
@@ -102,8 +104,17 @@ impl Server {
     fn from_openapi(yt: Arc<YouTrack>, spec: &Value) -> anyhow::Result<Self> {
         let operations = openapi::generate(spec)?;
         let generated_count = operations.len();
+        let mut output_schemas = HashMap::with_capacity(generated_count);
         let mut router = Self::tool_router();
-        for operation in operations {
+        for mut operation in operations {
+            let name = operation.tool.name.to_string();
+            let output_schema = operation
+                .tool
+                .output_schema
+                .take()
+                .map(|schema| Value::Object((*schema).clone()))
+                .unwrap_or(Value::Null);
+            output_schemas.insert(name, output_schema);
             let operation = Arc::new(operation);
             let tool = operation.tool.clone();
             router.add_route(Self::api_route(tool, operation));
@@ -113,7 +124,11 @@ impl Server {
             total_tools = router.list_all().len(),
             "loaded typed YouTrack API mirror"
         );
-        Ok(Self { yt, router })
+        Ok(Self {
+            yt,
+            router,
+            api_output_schemas: Arc::new(output_schemas),
+        })
     }
 
     fn api_route(tool: rmcp::model::Tool, operation: Arc<ApiOperation>) -> ToolRoute<Self> {
@@ -138,6 +153,28 @@ impl Server {
                 })
             },
         )
+    }
+
+    #[tool(
+        description = "Return the full OpenAPI output JSON Schema for a generated api_* operation. Generated output schemas are available on demand instead of being duplicated in tools/list, which keeps MCP discovery below infrastructure payload limits. Input schemas remain attached directly to every generated tool."
+    )]
+    async fn api_schema(
+        &self,
+        Parameters(a): Parameters<ApiSchemaArg>,
+    ) -> Result<String, ErrorData> {
+        let schema = self.api_output_schemas.get(&a.name).ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("api_schema unknown generated tool {:?}", a.name),
+                None,
+            )
+        })?;
+        serde_json::to_string(&serde_json::json!({
+            "tool": a.name,
+            "outputSchema": schema,
+        }))
+        .map_err(|error| {
+            ErrorData::internal_error(format!("serialize API output schema: {error}"), None)
+        })
     }
 
     #[tool(
@@ -577,7 +614,7 @@ fn sanitize_file_name(name: &str) -> String {
     // `version` deliberately omitted: the macro then reports CARGO_PKG_VERSION.
     // It used to be hardcoded and drifted to 0.1.0 while the crate was at 0.1.3,
     // so the handshake could not tell a client which build it had connected to.
-    instructions = "Complete typed YouTrack MCP. Every api_* tool mirrors one operation from the connected instance's /api/openapi.json; path/query/header/cookie parameters are top-level and request payloads use body. Generated tools include administrative and irreversible API operations, subject to YOUTRACK_TOKEN permissions. Curated-tool conventions: issue ids are readable like ABC-123 (bare numbers expand via YOUTRACK_DEFAULT_PROJECT). For parent/child use issue_write.parentId (native subtask) — NOT link_write. issue_write assignee=null clears the assignee. issue_write customFields=[{name,value}] updates arbitrary custom fields; use strings/string arrays for named single/multi values, null/[] to clear, or API-native JSON values. link_write needs sourceId+targetId+linkType (name e.g. 'Relates','Depend') and role outward|inward for directed types. Dates are ISO YYYY-MM-DD. tags must already exist (curated tools never create tags; unknown tag = error). issue_write op=delete permanently deletes the issue. workitem_write needs date+minutes (+type name like 'Разработка'); idempotent=true skips a same issue+date+description entry. workitems_list/report default to the current user. Errors state the missing/invalid field or return 'YouTrack <status>: <msg>' when the API rejected the call."
+    instructions = "Complete typed YouTrack MCP. Every api_* tool mirrors one operation from the connected instance's /api/openapi.json; path/query/header/cookie parameters are top-level and request payloads use body. Input schemas are attached to each generated tool; call api_schema with its name when the full output schema is needed. Generated tools include administrative and irreversible API operations, subject to YOUTRACK_TOKEN permissions. Curated-tool conventions: issue ids are readable like ABC-123 (bare numbers expand via YOUTRACK_DEFAULT_PROJECT). For parent/child use issue_write.parentId (native subtask) — NOT link_write. issue_write assignee=null clears the assignee. issue_write customFields=[{name,value}] updates arbitrary custom fields; use strings/string arrays for named single/multi values, null/[] to clear, or API-native JSON values. link_write needs sourceId+targetId+linkType (name e.g. 'Relates','Depend') and role outward|inward for directed types. Dates are ISO YYYY-MM-DD. tags must already exist (curated tools never create tags; unknown tag = error). issue_write op=delete permanently deletes the issue. workitem_write needs date+minutes (+type name like 'Разработка'); idempotent=true skips a same issue+date+description entry. workitems_list/report default to the current user. Errors state the missing/invalid field or return 'YouTrack <status>: <msg>' when the API rejected the call."
 )]
 impl ServerHandler for Server {}
 
@@ -654,8 +691,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn registers_every_generated_operation_beside_curated_tools() {
+    #[tokio::test]
+    async fn registers_generated_operations_with_output_schemas_available_on_demand() {
         let yt = YouTrack::new(crate::config::Config {
             base_url: "http://yt.invalid".into(),
             token: "t".into(),
@@ -684,14 +721,71 @@ mod tests {
         let server = Server::from_openapi(yt, &spec).unwrap();
         let tools = server.router.list_all();
         assert!(tools.iter().any(|tool| tool.name == "issue_write"));
-        assert!(tools.iter().any(|tool| tool.name == "api_get_widgets"));
-        assert!(tools.iter().any(|tool| tool.name == "api_post_widgets"));
+        assert!(tools.iter().any(|tool| tool.name == "api_schema"));
+        for name in ["api_get_widgets", "api_post_widgets"] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            assert!(
+                tool.output_schema.is_none(),
+                "generated output schemas must not inflate tools/list"
+            );
+        }
+
+        let schema = server
+            .api_schema(Parameters(ApiSchemaArg {
+                name: "api_get_widgets".into(),
+            }))
+            .await
+            .unwrap();
+        let schema: Value = serde_json::from_str(&schema).unwrap();
+        assert_eq!(schema["tool"], "api_get_widgets");
+        assert_eq!(schema["outputSchema"]["type"], "array");
         assert_eq!(
-            tools
-                .iter()
-                .filter(|tool| tool.name.starts_with("api_"))
-                .count(),
-            2
+            schema["outputSchema"]["items"]["type"],
+            serde_json::json!("object")
+        );
+    }
+
+    #[test]
+    fn generated_output_schema_cannot_push_discovery_over_cosmos_item_limit() {
+        const COSMOS_DB_ITEM_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
+        let yt = YouTrack::new(crate::config::Config {
+            base_url: "http://yt.invalid".into(),
+            token: "t".into(),
+            timezone: chrono_tz::Europe::Moscow,
+            default_project: None,
+            holidays: Default::default(),
+            pre_holidays: Default::default(),
+            user_aliases: Default::default(),
+            download_dir: None,
+        })
+        .unwrap();
+        let spec = serde_json::json!({
+            "openapi":"3.0.1",
+            "paths":{
+                "/oversized":{
+                    "get":{"responses":{"200":{"content":{"application/json":{
+                        "schema":{
+                            "type":"object",
+                            "description":"x".repeat(COSMOS_DB_ITEM_LIMIT_BYTES)
+                        }
+                    }}}}}
+                }
+            }
+        });
+
+        let server = Server::from_openapi(yt, &spec).unwrap();
+        assert!(
+            server.api_output_schemas["api_get_oversized"]
+                .to_string()
+                .len()
+                > COSMOS_DB_ITEM_LIMIT_BYTES
+        );
+        let discovery = serde_json::to_vec(&server.router.list_all()).unwrap();
+        assert!(
+            discovery.len() < COSMOS_DB_ITEM_LIMIT_BYTES,
+            "tools/list payload was {} bytes",
+            discovery.len()
         );
     }
 
