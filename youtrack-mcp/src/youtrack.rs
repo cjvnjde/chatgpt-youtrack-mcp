@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use base64::Engine;
@@ -8,7 +8,8 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
-use crate::model::Entity;
+use crate::model::{CustomFieldWrite, Entity};
+use crate::openapi::{ApiOperation, ApiResponse, ApiResponseBody, PreparedBody};
 
 const F_ISSUE: &str = "id,idReadable,summary,description,usesMarkdown,created,updated,resolved,project(id,shortName,name),parent(issues(idReadable,summary)),assignee(id,login,name),reporter(id,login,name),tags(id,name),customFields(id,name,value(id,login,name,presentation),$type)";
 const F_ISSUE_SHORT: &str = "id,idReadable,summary,project(shortName),customFields(name,value(name,login,presentation),$type)";
@@ -17,7 +18,8 @@ const F_LINKS: &str = "id,direction,linkType(id,name,directed,sourceToTarget,tar
 const F_LINK_TYPES: &str = "id,name,directed,sourceToTarget,targetToSource,aggregation";
 const F_COMMENT: &str = "id,text,usesMarkdown,author(id,login,name),created,updated";
 const F_ARTICLE: &str = "id,idReadable,summary,content,usesMarkdown,parentArticle(id,idReadable),project(id,shortName,name)";
-const F_ARTICLE_LIST: &str = "id,idReadable,summary,parentArticle(id,idReadable),project(shortName)";
+const F_ARTICLE_LIST: &str =
+    "id,idReadable,summary,parentArticle(id,idReadable),project(shortName)";
 const F_WORKITEM: &str = "id,date,updated,duration(minutes,presentation),text,description,usesMarkdown,type(id,name),issue(id,idReadable),author(id,login,name)";
 const F_USERS: &str = "id,login,name,fullName,email";
 const F_PROJECTS: &str = "id,shortName,name";
@@ -59,10 +61,17 @@ fn is_id(s: &str) -> bool {
             && b.bytes().all(|c| c.is_ascii_digit()))
 }
 
-
 fn require<'a>(opt: Option<&'a String>, msg: &str) -> Result<&'a str> {
     opt.map(|s| s.as_str())
         .ok_or_else(|| AppError::Bad(msg.to_string()))
+}
+
+fn api_scalar(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Null => String::new(),
+        _ => value.to_string(),
+    }
 }
 
 /// True if `node.name` or `node.id` matches `needle`, comparing trimmed and
@@ -84,14 +93,20 @@ fn name_or_id_eq(node: &Value, needle: &str) -> bool {
 /// surfaced on failure. `cap` bounds long lists, and states how many it cut:
 /// a silently short list is what sent callers guessing ids in the first place.
 fn quoted_names(nodes: &[Value], cap: Option<usize>) -> String {
-    let names: Vec<&str> =
-        nodes.iter().filter_map(|n| n.get("name").and_then(Value::as_str)).collect();
+    let names: Vec<&str> = nodes
+        .iter()
+        .filter_map(|n| n.get("name").and_then(Value::as_str))
+        .collect();
     if names.is_empty() {
         return "none".to_string();
     }
     let cap = cap.unwrap_or(names.len());
-    let shown =
-        names.iter().take(cap).map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+    let shown = names
+        .iter()
+        .take(cap)
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     match names.len().saturating_sub(cap) {
         0 => shown,
         rest => format!("{shown} … and {rest} more"),
@@ -127,8 +142,10 @@ fn attach_str(node: &Value, key: &str) -> String {
 /// matches exactly is the trimmed/case-folded comparison tried, so `a.PNG` can
 /// never shadow a literal `a.png` that exists alongside it.
 fn match_by_name<'a>(items: &'a [Value], needle: &str) -> Vec<&'a Value> {
-    let exact: Vec<&Value> =
-        items.iter().filter(|a| a.get("name").and_then(Value::as_str) == Some(needle)).collect();
+    let exact: Vec<&Value> = items
+        .iter()
+        .filter(|a| a.get("name").and_then(Value::as_str) == Some(needle))
+        .collect();
     if !exact.is_empty() {
         return exact;
     }
@@ -200,8 +217,7 @@ impl YouTrack {
             if body.trim().is_empty() {
                 return Ok(Value::Null);
             }
-            serde_json::from_str(&body)
-                .map_err(|e| AppError::Network(format!("bad JSON: {e}")))
+            serde_json::from_str(&body).map_err(|e| AppError::Network(format!("bad JSON: {e}")))
         } else {
             let msg = serde_json::from_str::<Value>(&body)
                 .ok()
@@ -214,7 +230,10 @@ impl YouTrack {
                     None
                 })
                 .unwrap_or_else(|| body.chars().take(200).collect());
-            Err(AppError::Api { status: status.as_u16(), message: msg })
+            Err(AppError::Api {
+                status: status.as_u16(),
+                message: msg,
+            })
         }
     }
 
@@ -239,7 +258,140 @@ impl YouTrack {
         self.check(resp).await
     }
 
-    async fn send_json(&self, method: Method, path: &str, query: &[(&str, String)], body: &Value) -> Result<Value> {
+    pub async fn openapi_spec(&self) -> Result<Value> {
+        self.get("/api/openapi.json", &[]).await
+    }
+
+    pub async fn execute_api_operation(
+        &self,
+        operation: &ApiOperation,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<ApiResponse> {
+        let prepared = operation.prepare(args).map_err(AppError::Bad)?;
+        let client = if operation.method == Method::GET || operation.method == Method::HEAD {
+            &self.http_files
+        } else {
+            &self.http
+        };
+        let mut request = client
+            .request(operation.method.clone(), self.url(&prepared.path))
+            .query(&prepared.query);
+        for (name, value) in prepared.headers {
+            request = request.header(name, value);
+        }
+        request = match prepared.body {
+            Some(PreparedBody::Json(body)) => {
+                let request = request.json(&body);
+                if prepared.content_type.as_deref() == Some("application/json") {
+                    request
+                } else {
+                    request.header(
+                        reqwest::header::CONTENT_TYPE,
+                        prepared
+                            .content_type
+                            .as_deref()
+                            .unwrap_or("application/json"),
+                    )
+                }
+            }
+            Some(PreparedBody::Form(fields)) => request.form(&fields),
+            Some(PreparedBody::Multipart {
+                fields,
+                binary_fields,
+            }) => {
+                let mut form = reqwest::multipart::Form::new();
+                for (name, value) in fields {
+                    if binary_fields.contains(&name) {
+                        let encoded_values: Vec<&str> = match &value {
+                            Value::String(value) => vec![value],
+                            Value::Array(values) => values
+                                .iter()
+                                .map(|value| {
+                                    value.as_str().ok_or_else(|| {
+                                        AppError::Bad(format!(
+                                            "multipart binary field {name:?} must contain base64 strings"
+                                        ))
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                            _ => {
+                                return Err(AppError::Bad(format!(
+                                    "multipart binary field {name:?} must be base64 or an array of base64 strings"
+                                )));
+                            }
+                        };
+                        for encoded in encoded_values {
+                            let bytes = Self::b64_decode(encoded)?;
+                            let part =
+                                reqwest::multipart::Part::bytes(bytes).file_name(name.clone());
+                            form = form.part(name.clone(), part);
+                        }
+                    } else {
+                        match value {
+                            Value::Array(values) => {
+                                for value in values {
+                                    form = form.text(name.clone(), api_scalar(&value));
+                                }
+                            }
+                            value => form = form.text(name, api_scalar(&value)),
+                        }
+                    }
+                }
+                request.multipart(form)
+            }
+            Some(PreparedBody::Binary(body)) => request
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    prepared
+                        .content_type
+                        .as_deref()
+                        .unwrap_or("application/octet-stream"),
+                )
+                .body(body),
+            Some(PreparedBody::Text(body)) => request
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    prepared.content_type.as_deref().unwrap_or("text/plain"),
+                )
+                .body(body),
+            None => request,
+        };
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.bytes().await?;
+        let body = if bytes.is_empty() {
+            ApiResponseBody::Empty
+        } else if let Ok(json) = serde_json::from_slice(&bytes) {
+            ApiResponseBody::Json(json)
+        } else if content_type.as_deref().is_some_and(|content_type| {
+            content_type.starts_with("text/")
+                || content_type.contains("xml")
+                || content_type.contains("javascript")
+                || content_type.contains("x-www-form-urlencoded")
+        }) {
+            ApiResponseBody::Text(String::from_utf8_lossy(&bytes).into_owned())
+        } else {
+            ApiResponseBody::Binary(Self::b64_encode(&bytes))
+        };
+        Ok(ApiResponse {
+            status,
+            content_type,
+            body,
+        })
+    }
+
+    async fn send_json(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: &Value,
+    ) -> Result<Value> {
         let resp = self
             .http
             .request(method, self.url(path))
@@ -277,10 +429,17 @@ impl YouTrack {
     /// warned about rather than passed off as a complete list.
     async fn list(&self, path: &str, fields: &str, top: i64) -> Result<Value> {
         let v = self
-            .get(path, &[("fields", fields.to_string()), ("$top", top.to_string())])
+            .get(
+                path,
+                &[("fields", fields.to_string()), ("$top", top.to_string())],
+            )
             .await?;
         if v.as_array().is_some_and(|a| a.len() as i64 >= top) {
-            tracing::warn!(path, top, "collection filled the page; results may be truncated");
+            tracing::warn!(
+                path,
+                top,
+                "collection filled the page; results may be truncated"
+            );
         }
         Ok(v)
     }
@@ -305,7 +464,10 @@ impl YouTrack {
             return Ok(id.clone());
         }
         let list = self
-            .get(endpoint, &[("fields", fields.to_string()), ("$top", "1000".to_string())])
+            .get(
+                endpoint,
+                &[("fields", fields.to_string()), ("$top", "1000".to_string())],
+            )
             .await?;
         let mut map = cache.write().await;
         if let Some(arr) = list.as_array() {
@@ -324,8 +486,15 @@ impl YouTrack {
     }
 
     pub async fn project_id(&self, project: &str) -> Result<String> {
-        self.cached_id(&self.projects, "/api/admin/projects", F_PROJECTS, "shortName", project, "project")
-            .await
+        self.cached_id(
+            &self.projects,
+            "/api/admin/projects",
+            F_PROJECTS,
+            "shortName",
+            project,
+            "project",
+        )
+        .await
     }
 
     async fn user_value(&self, login: &str) -> Result<Value> {
@@ -341,7 +510,10 @@ impl YouTrack {
         ];
         let res = self.get("/api/users", &q).await?;
         if let Some(arr) = res.as_array() {
-            if let Some(u) = arr.iter().find(|u| u.get("login").and_then(|x| x.as_str()) == Some(&login)) {
+            if let Some(u) = arr
+                .iter()
+                .find(|u| u.get("login").and_then(|x| x.as_str()) == Some(&login))
+            {
                 return Ok(json!({"id": u.get("id"), "login": login}));
             }
             if let Some(u) = arr.first() {
@@ -373,7 +545,9 @@ impl YouTrack {
                 return Ok(t.clone());
             }
         }
-        let list = self.list("/api/issueLinkTypes", F_LINK_TYPES, LIST_TOP).await?;
+        let list = self
+            .list("/api/issueLinkTypes", F_LINK_TYPES, LIST_TOP)
+            .await?;
         let arr = list.as_array().cloned().unwrap_or_default();
         *self.link_types.write().await = arr.clone();
         arr.into_iter()
@@ -388,10 +562,17 @@ impl YouTrack {
 
     pub async fn issue_get(&self, id: &str) -> Result<Value> {
         let id = self.cfg.expand_issue_id(id);
-        self.get(&format!("/api/issues/{id}"), &self.fq(F_ISSUE)).await
+        self.get(&format!("/api/issues/{id}"), &self.fq(F_ISSUE))
+            .await
     }
 
-    pub async fn issue_search(&self, query: &str, full: bool, top: i64, skip: i64) -> Result<Value> {
+    pub async fn issue_search(
+        &self,
+        query: &str,
+        full: bool,
+        top: i64,
+        skip: i64,
+    ) -> Result<Value> {
         let fields = if full { F_ISSUE_FULL } else { F_ISSUE_SHORT };
         let q = [
             ("fields", fields.to_string()),
@@ -404,14 +585,22 @@ impl YouTrack {
 
     pub async fn issue_links(&self, id: &str) -> Result<Value> {
         let id = self.cfg.expand_issue_id(id);
-        self.list(&format!("/api/issues/{id}/links"), F_LINKS, LIST_TOP).await
+        self.list(&format!("/api/issues/{id}/links"), F_LINKS, LIST_TOP)
+            .await
     }
 
     /// Resolve an existing tag name to its id. This server never creates tags;
     /// an unknown name is an error.
     async fn tag_id(&self, name: &str) -> Result<String> {
-        self.cached_id(&self.tags, "/api/tags", "id,name", "name", name, "tag (must already exist)")
-            .await
+        self.cached_id(
+            &self.tags,
+            "/api/tags",
+            "id,name",
+            "name",
+            name,
+            "tag (must already exist)",
+        )
+        .await
     }
 
     /// Attach an issue to an agile board/sprint.
@@ -437,8 +626,15 @@ impl YouTrack {
         let aid = agile
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| AppError::Api { status: 500, message: "agile board missing id".into() })?;
-        let sprints = agile.get("sprints").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+            .ok_or_else(|| AppError::Api {
+                status: 500,
+                message: "agile board missing id".into(),
+            })?;
+        let sprints = agile
+            .get("sprints")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let sid = match sprint {
             Some(s) => sprints
                 .iter()
@@ -458,7 +654,10 @@ impl YouTrack {
                 [only] => only
                     .get("id")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| AppError::Api { status: 500, message: "sprint missing id".into() })?
+                    .ok_or_else(|| AppError::Api {
+                        status: 500,
+                        message: "sprint missing id".into(),
+                    })?
                     .to_string(),
                 [] => return Ok(()),
                 _ => {
@@ -470,8 +669,12 @@ impl YouTrack {
             },
         };
         let body = json!({"$type": "Issue", "idReadable": id_readable});
-        self.post(&format!("/api/agiles/{aid}/sprints/{sid}/issues"), &[], &body)
-            .await?;
+        self.post(
+            &format!("/api/agiles/{aid}/sprints/{sid}/issues"),
+            &[],
+            &body,
+        )
+        .await?;
         Ok(())
     }
 
@@ -488,7 +691,8 @@ impl YouTrack {
         match parent {
             Some(p) => {
                 let p = self.cfg.expand_issue_id(p);
-                self.command(&format!("subtask of {p}"), child_readable).await
+                self.command(&format!("subtask of {p}"), child_readable)
+                    .await
             }
             None => {
                 let cur = self
@@ -497,8 +701,12 @@ impl YouTrack {
                         &self.fq("parent(issues(idReadable))"),
                     )
                     .await?;
-                if let Some(p) = cur.pointer("/parent/issues/0/idReadable").and_then(|x| x.as_str()) {
-                    self.command(&format!("remove subtask of {p}"), child_readable).await?;
+                if let Some(p) = cur
+                    .pointer("/parent/issues/0/idReadable")
+                    .and_then(|x| x.as_str())
+                {
+                    self.command(&format!("remove subtask of {p}"), child_readable)
+                        .await?;
                 }
                 Ok(())
             }
@@ -521,11 +729,19 @@ impl YouTrack {
             body["usesMarkdown"] = json!(m);
         }
         let created = self.post("/api/issues", &self.fq(F_ISSUE), &body).await?;
-        let internal = created.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-        let readable =
-            created.get("idReadable").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+        let internal = created
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let readable = created
+            .get("idReadable")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
         if self.apply_side_effects(&internal, &readable, a).await? {
-            self.get(&format!("/api/issues/{internal}"), &self.fq(F_ISSUE)).await
+            self.get(&format!("/api/issues/{internal}"), &self.fq(F_ISSUE))
+                .await
         } else {
             Ok(created)
         }
@@ -548,27 +764,166 @@ impl YouTrack {
             body["usesMarkdown"] = json!(m);
         }
         let mut current = if body.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
-            Some(self.post(&format!("/api/issues/{id}"), &self.fq(F_ISSUE), &body).await?)
+            Some(
+                self.post(&format!("/api/issues/{id}"), &self.fq(F_ISSUE), &body)
+                    .await?,
+            )
         } else {
             None
         };
         if self.apply_side_effects(&id, &id, a).await? || current.is_none() {
-            current = Some(self.get(&format!("/api/issues/{id}"), &self.fq(F_ISSUE)).await?);
+            current = Some(
+                self.get(&format!("/api/issues/{id}"), &self.fq(F_ISSUE))
+                    .await?,
+            );
         }
         Ok(current.unwrap())
     }
 
-    /// Apply assignee/state/tags in a single issue POST and board via command.
+    fn normalize_custom_field_value(field_type: &str, value: &Value) -> Value {
+        let reference_key = if field_type.contains("UserIssueCustomField") {
+            Some("login")
+        } else if field_type == "StateIssueCustomField"
+            || field_type.starts_with("Single")
+            || field_type.starts_with("Multi")
+        {
+            Some("name")
+        } else {
+            None
+        };
+        let Some(reference_key) = reference_key else {
+            return value.clone();
+        };
+
+        let reference = |name: &str| match reference_key {
+            "login" => json!({"login": name}),
+            _ => json!({"name": name}),
+        };
+        match value {
+            Value::String(name) if !field_type.starts_with("Multi") => reference(name),
+            Value::Array(values)
+                if field_type.starts_with("Multi") && values.iter().all(Value::is_string) =>
+            {
+                Value::Array(
+                    values
+                        .iter()
+                        .map(|value| reference(value.as_str().unwrap()))
+                        .collect(),
+                )
+            }
+            _ => value.clone(),
+        }
+    }
+
+    async fn resolve_custom_field_updates(
+        &self,
+        issue_id: &str,
+        requested: &[CustomFieldWrite],
+    ) -> Result<Vec<Value>> {
+        let issue = self
+            .get(
+                &format!("/api/issues/{issue_id}"),
+                &self.fq("customFields(id,name,$type)"),
+            )
+            .await?;
+        let available = issue
+            .get("customFields")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                AppError::Bad("YouTrack returned no customFields for the issue".into())
+            })?;
+        let mut resolved = Vec::with_capacity(requested.len());
+        let mut seen = HashSet::with_capacity(requested.len());
+
+        for update in requested {
+            let matches: Vec<&Value> = available
+                .iter()
+                .filter(|field| name_or_id_eq(field, &update.name))
+                .collect();
+            let field = match matches.as_slice() {
+                [field] => *field,
+                [] => {
+                    return Err(AppError::Bad(format!(
+                        "unknown custom field {:?}; valid fields: {}",
+                        update.name,
+                        quoted_names(available, Some(40))
+                    )));
+                }
+                _ => {
+                    return Err(AppError::Bad(format!(
+                        "custom field name {:?} is ambiguous",
+                        update.name
+                    )));
+                }
+            };
+            let field_id = field.get("id").and_then(Value::as_str).ok_or_else(|| {
+                AppError::Bad(format!("custom field {:?} has no id", update.name))
+            })?;
+            if !seen.insert(field_id) {
+                return Err(AppError::Bad(format!(
+                    "custom field {:?} was provided more than once",
+                    update.name
+                )));
+            }
+            let field_type = field.get("$type").and_then(Value::as_str).ok_or_else(|| {
+                AppError::Bad(format!("custom field {:?} has no $type", update.name))
+            })?;
+            resolved.push(json!({
+                "id": field_id,
+                "$type": field_type,
+                "value": Self::normalize_custom_field_value(field_type, &update.value),
+            }));
+        }
+        Ok(resolved)
+    }
+
+    /// Apply assignee/custom fields/state/tags in a single issue POST and board via command.
     /// Returns true if anything was changed (caller then re-reads the issue).
-    async fn apply_side_effects(&self, id: &str, readable: &str, a: &crate::model::IssueWrite) -> Result<bool> {
+    async fn apply_side_effects(
+        &self,
+        id: &str,
+        readable: &str,
+        a: &crate::model::IssueWrite,
+    ) -> Result<bool> {
         let mut fields = Vec::new();
-        if let Some(login) = &a.assignee {
-            let mut user = self.user_value(login).await?;
-            user["$type"] = json!("User");
-            fields.push(json!({"name":"Assignee","$type":"SingleUserIssueCustomField","value":user}));
+        if let Some(assignee) = &a.assignee {
+            let value = match assignee {
+                Some(login) => {
+                    let mut user = self.user_value(login).await?;
+                    user["$type"] = json!("User");
+                    user
+                }
+                None => Value::Null,
+            };
+            fields.push(
+                json!({"name":"Assignee","$type":"SingleUserIssueCustomField","value":value}),
+            );
         }
         if let Some(state) = &a.state {
-            fields.push(json!({"name":"State","$type":"StateIssueCustomField","value":{"name":state}}));
+            fields.push(
+                json!({"name":"State","$type":"StateIssueCustomField","value":{"name":state}}),
+            );
+        }
+        if let Some(custom_fields) = a.custom_fields.as_ref().filter(|fields| !fields.is_empty()) {
+            if a.assignee.is_some()
+                && custom_fields
+                    .iter()
+                    .any(|field| field.name.trim().eq_ignore_ascii_case("Assignee"))
+            {
+                return Err(AppError::Bad(
+                    "provide Assignee through either assignee or customFields, not both".into(),
+                ));
+            }
+            if a.state.is_some()
+                && custom_fields
+                    .iter()
+                    .any(|field| field.name.trim().eq_ignore_ascii_case("State"))
+            {
+                return Err(AppError::Bad(
+                    "provide State through either state or customFields, not both".into(),
+                ));
+            }
+            fields.extend(self.resolve_custom_field_updates(id, custom_fields).await?);
         }
         let mut body = json!({});
         if !fields.is_empty() {
@@ -604,9 +959,18 @@ impl YouTrack {
     // ---- links ----
 
     fn link_keyword(lt: &Value, inward: bool) -> Result<String> {
-        let directed = lt.get("directed").and_then(|x| x.as_bool()).unwrap_or(false);
-        let s = lt.get("sourceToTarget").and_then(|x| x.as_str()).unwrap_or("");
-        let t = lt.get("targetToSource").and_then(|x| x.as_str()).unwrap_or("");
+        let directed = lt
+            .get("directed")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let s = lt
+            .get("sourceToTarget")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let t = lt
+            .get("targetToSource")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
         let k = if directed && inward { t } else { s };
         if k.is_empty() {
             Err(AppError::Bad("link type has no usable keyword".into()))
@@ -615,31 +979,50 @@ impl YouTrack {
         }
     }
 
-    pub async fn link_add(&self, source: &str, target: &str, link_type: &str, inward: bool) -> Result<Value> {
+    pub async fn link_add(
+        &self,
+        source: &str,
+        target: &str,
+        link_type: &str,
+        inward: bool,
+    ) -> Result<Value> {
         let source = self.cfg.expand_issue_id(source);
         let target = self.cfg.expand_issue_id(target);
         let lt = self.link_type(link_type).await?;
-        let body = json!({"linkType": {"name": lt.get("name")}, "issues": [{"idReadable": target}]});
+        let body =
+            json!({"linkType": {"name": lt.get("name")}, "issues": [{"idReadable": target}]});
         match self
-            .post(&format!("/api/issues/{source}/links"), &self.fq(F_LINKS), &body)
+            .post(
+                &format!("/api/issues/{source}/links"),
+                &self.fq(F_LINKS),
+                &body,
+            )
             .await
         {
             Ok(v) => Ok(v),
             Err(AppError::Api { status, .. }) if status == 404 || status == 405 => {
                 let keyword = Self::link_keyword(&lt, inward)?;
-                self.command(&format!("{keyword}: {target}"), &source).await?;
+                self.command(&format!("{keyword}: {target}"), &source)
+                    .await?;
                 Ok(json!({"linked": true, "source": source, "target": target, "via": "command"}))
             }
             Err(e) => Err(e),
         }
     }
 
-    pub async fn link_remove(&self, source: &str, target: &str, link_type: &str, inward: bool) -> Result<Value> {
+    pub async fn link_remove(
+        &self,
+        source: &str,
+        target: &str,
+        link_type: &str,
+        inward: bool,
+    ) -> Result<Value> {
         let source = self.cfg.expand_issue_id(source);
         let target = self.cfg.expand_issue_id(target);
         let lt = self.link_type(link_type).await?;
         let keyword = Self::link_keyword(&lt, inward)?;
-        self.command(&format!("remove {keyword}: {target}"), &source).await?;
+        self.command(&format!("remove {keyword}: {target}"), &source)
+            .await?;
         Ok(json!({"unlinked": true, "source": source, "target": target}))
     }
 
@@ -668,7 +1051,8 @@ impl YouTrack {
     }
 
     pub async fn comments_list(&self, entity: Entity, parent: &str) -> Result<Value> {
-        self.list(&self.comment_root(entity, parent), F_COMMENT, LIST_TOP).await
+        self.list(&self.comment_root(entity, parent), F_COMMENT, LIST_TOP)
+            .await
     }
 
     /// Create (comment_id None) or update (Some) a comment on an issue/article.
@@ -700,11 +1084,15 @@ impl YouTrack {
     // ---- articles ----
 
     pub async fn article_get(&self, id: &str) -> Result<Value> {
-        self.get(&format!("/api/articles/{id}"), &self.fq(F_ARTICLE)).await
+        self.get(&format!("/api/articles/{id}"), &self.fq(F_ARTICLE))
+            .await
     }
 
     pub async fn article_list(&self, query: Option<&str>) -> Result<Value> {
-        let mut q = vec![("fields", F_ARTICLE_LIST.to_string()), ("$top", "100".to_string())];
+        let mut q = vec![
+            ("fields", F_ARTICLE_LIST.to_string()),
+            ("$top", "100".to_string()),
+        ];
         if let Some(query) = query {
             q.push(("query", query.to_string()));
         }
@@ -749,7 +1137,8 @@ impl YouTrack {
         if let Some(p) = &a.parent_article_id {
             body["parentArticle"] = json!({"id": p});
         }
-        self.post(&format!("/api/articles/{id}"), &self.fq(F_ARTICLE), &body).await
+        self.post(&format!("/api/articles/{id}"), &self.fq(F_ARTICLE), &body)
+            .await
     }
 
     // ---- work items ----
@@ -807,7 +1196,11 @@ impl YouTrack {
         let minutes = a.minutes.ok_or_else(|| {
             AppError::Bad("workitem_write op=create requires 'minutes' (integer duration)".into())
         })?;
-        let desc = a.description.clone().or_else(|| a.text.clone()).unwrap_or_default();
+        let desc = a
+            .description
+            .clone()
+            .or_else(|| a.text.clone())
+            .unwrap_or_default();
 
         if a.idempotent.unwrap_or(false) {
             let existing = self
@@ -845,15 +1238,12 @@ impl YouTrack {
 
     pub async fn workitem_update(&self, a: &crate::model::WorkitemWrite) -> Result<Value> {
         let issue = self.cfg.expand_issue_id(&a.issue_id);
-        let wid = a
-            .work_item_id
-            .as_deref()
-            .ok_or_else(|| {
-                AppError::Bad(
-                    "workitem_write op=update requires 'workItemId' (get it from workitems_list)"
-                        .into(),
-                )
-            })?;
+        let wid = a.work_item_id.as_deref().ok_or_else(|| {
+            AppError::Bad(
+                "workitem_write op=update requires 'workItemId' (get it from workitems_list)"
+                    .into(),
+            )
+        })?;
         let mut body = json!({});
         if let Some(d) = &a.date {
             body["date"] = json!(self.date_to_epoch_ms(d)?);
@@ -888,19 +1278,25 @@ impl YouTrack {
                             .map(|ms| self.epoch_ms_to_iso(ms))
                     }),
                     minutes: a.minutes.or_else(|| {
-                        existing.get("duration").and_then(|d| d.get("minutes")).and_then(|x| x.as_i64())
+                        existing
+                            .get("duration")
+                            .and_then(|d| d.get("minutes"))
+                            .and_then(|x| x.as_i64())
                     }),
                     text: a.text.clone(),
-                    description: a
-                        .description
-                        .clone()
-                        .or_else(|| existing.get("description").and_then(|x| x.as_str()).map(String::from)),
+                    description: a.description.clone().or_else(|| {
+                        existing
+                            .get("description")
+                            .and_then(|x| x.as_str())
+                            .map(String::from)
+                    }),
                     work_type: a.work_type.clone(),
                     markdown: a.markdown,
                     idempotent: None,
                 };
                 let created = self.workitem_create(&merged).await?;
-                self.delete(&format!("/api/issues/{issue}/timeTracking/workItems/{wid}")).await?;
+                self.delete(&format!("/api/issues/{issue}/timeTracking/workItems/{wid}"))
+                    .await?;
                 Ok(created)
             }
             Err(e) => Err(e),
@@ -919,7 +1315,8 @@ impl YouTrack {
 
     pub async fn workitem_delete(&self, issue: &str, wid: &str) -> Result<Value> {
         let issue = self.cfg.expand_issue_id(issue);
-        self.delete(&format!("/api/issues/{issue}/timeTracking/workItems/{wid}")).await?;
+        self.delete(&format!("/api/issues/{issue}/timeTracking/workItems/{wid}"))
+            .await?;
         Ok(json!({"deleted": true, "issueId": issue, "workItemId": wid}))
     }
 
@@ -966,7 +1363,8 @@ impl YouTrack {
         if let Some(e) = end {
             q.push(("end", self.activity_ts(e)?.to_string()));
         }
-        self.get(&format!("/api/issues/{issue}/activities"), &q).await
+        self.get(&format!("/api/issues/{issue}/activities"), &q)
+            .await
     }
 
     pub async fn users_activity(
@@ -1035,7 +1433,8 @@ impl YouTrack {
     }
 
     pub async fn user_get(&self, id: &str) -> Result<Value> {
-        self.get(&format!("/api/users/{id}"), &self.fq(F_USERS)).await
+        self.get(&format!("/api/users/{id}"), &self.fq(F_USERS))
+            .await
     }
 
     pub async fn meta_projects(&self) -> Result<Value> {
@@ -1043,7 +1442,8 @@ impl YouTrack {
     }
 
     pub async fn meta_link_types(&self) -> Result<Value> {
-        self.list("/api/issueLinkTypes", F_LINK_TYPES, LIST_TOP).await
+        self.list("/api/issueLinkTypes", F_LINK_TYPES, LIST_TOP)
+            .await
     }
 
     pub async fn meta_work_types(&self, project: Option<&str>) -> Result<Value> {
@@ -1058,7 +1458,12 @@ impl YouTrack {
                 .await
             }
             None => {
-                self.list("/api/admin/timeTrackingSettings/workItemTypes", "id,name", LIST_TOP).await
+                self.list(
+                    "/api/admin/timeTrackingSettings/workItemTypes",
+                    "id,name",
+                    LIST_TOP,
+                )
+                .await
             }
         }
     }
@@ -1072,10 +1477,14 @@ impl YouTrack {
     /// Raw listing, always paged explicitly — YouTrack's implicit default cuts
     /// off at 42 with nothing in the response saying so.
     async fn attachments_raw(&self, entity: Entity, parent: &str, top: i64) -> Result<Vec<Value>> {
-        let v = self.list(&self.attach_root(entity, parent), F_ATTACH, top).await?;
+        let v = self
+            .list(&self.attach_root(entity, parent), F_ATTACH, top)
+            .await?;
         match v {
             Value::Array(a) => Ok(a),
-            other => Err(AppError::Bad(format!("expected attachment array, got {other}"))),
+            other => Err(AppError::Bad(format!(
+                "expected attachment array, got {other}"
+            ))),
         }
     }
 
@@ -1097,7 +1506,11 @@ impl YouTrack {
     }
 
     pub async fn attachment_get(&self, entity: Entity, parent: &str, aid: &str) -> Result<Value> {
-        self.get(&format!("{}/{aid}", self.attach_root(entity, parent)), &self.fq(F_ATTACH)).await
+        self.get(
+            &format!("{}/{aid}", self.attach_root(entity, parent)),
+            &self.fq(F_ATTACH),
+        )
+        .await
     }
 
     /// Resolve an attachment reference. `aid` wins; otherwise `name` is matched
@@ -1114,7 +1527,10 @@ impl YouTrack {
         top: i64,
     ) -> Result<Resolved> {
         if let Some(id) = aid {
-            return Ok(Resolved { id: id.to_string(), meta: None });
+            return Ok(Resolved {
+                id: id.to_string(),
+                meta: None,
+            });
         }
         let Some(name) = name else {
             return Err(AppError::Bad("requires 'attachmentId' or 'name'".into()));
@@ -1122,7 +1538,10 @@ impl YouTrack {
         let items = self.attachments_raw(entity, parent, top).await?;
         let matches = match_by_name(&items, name);
         match matches.as_slice() {
-            [one] => Ok(Resolved { id: attach_str(one, "id"), meta: Some((*one).clone()) }),
+            [one] => Ok(Resolved {
+                id: attach_str(one, "id"),
+                meta: Some((*one).clone()),
+            }),
             [] => Err(AppError::Bad(format!(
                 "no attachment named {name:?} on {parent}. Available: {}",
                 quoted_names(&items, Some(NAMES_IN_ERROR))
@@ -1175,7 +1594,11 @@ impl YouTrack {
 
     /// Returns `(name, mimeType, bytes)`.
     pub async fn attachment_download(&self, meta: &Value) -> Result<(String, String, Vec<u8>)> {
-        let name = meta.get("name").and_then(Value::as_str).unwrap_or("attachment").to_string();
+        let name = meta
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("attachment")
+            .to_string();
         let mime = meta
             .get("mimeType")
             .and_then(Value::as_str)
@@ -1205,8 +1628,14 @@ impl YouTrack {
         Ok(resp.bytes().await?.to_vec())
     }
 
-    pub async fn attachment_delete(&self, entity: Entity, parent: &str, aid: &str) -> Result<Value> {
-        self.delete(&format!("{}/{aid}", self.attach_root(entity, parent))).await?;
+    pub async fn attachment_delete(
+        &self,
+        entity: Entity,
+        parent: &str,
+        aid: &str,
+    ) -> Result<Value> {
+        self.delete(&format!("{}/{aid}", self.attach_root(entity, parent)))
+            .await?;
         // Echo the id YouTrack actually addressed, not the shorthand we were
         // handed — a caller passing "435" should see "Culture-435" back.
         Ok(json!({
@@ -1251,8 +1680,14 @@ mod tests {
 
     #[test]
     fn quoted_names_quotes_and_joins() {
-        let nodes = vec![json!({"name": "Первый спринт"}), json!({"name": "2 Спринт"})];
-        assert_eq!(quoted_names(&nodes, None), "\"Первый спринт\", \"2 Спринт\"");
+        let nodes = vec![
+            json!({"name": "Первый спринт"}),
+            json!({"name": "2 Спринт"}),
+        ];
+        assert_eq!(
+            quoted_names(&nodes, None),
+            "\"Первый спринт\", \"2 Спринт\""
+        );
     }
 
     #[test]
@@ -1275,7 +1710,10 @@ mod tests {
     fn match_by_name_finds_single_exact() {
         let items = vec![attach("7-1", "a.png"), attach("7-2", "b.png")];
         let hits = match_by_name(&items, "b.png");
-        assert_eq!(hits.iter().map(|h| attach_str(h, "id")).collect::<Vec<_>>(), ["7-2"]);
+        assert_eq!(
+            hits.iter().map(|h| attach_str(h, "id")).collect::<Vec<_>>(),
+            ["7-2"]
+        );
     }
 
     #[test]
@@ -1289,7 +1727,10 @@ mod tests {
     fn match_by_name_prefers_exact_over_case_variant() {
         let items = vec![attach("7-1", "a.PNG"), attach("7-2", "a.png")];
         let hits = match_by_name(&items, "a.png");
-        assert_eq!(hits.iter().map(|h| attach_str(h, "id")).collect::<Vec<_>>(), ["7-2"]);
+        assert_eq!(
+            hits.iter().map(|h| attach_str(h, "id")).collect::<Vec<_>>(),
+            ["7-2"]
+        );
     }
 
     #[test]
@@ -1308,13 +1749,17 @@ mod tests {
     #[test]
     fn quoted_names_lists_all_when_under_cap() {
         let items = vec![attach("7-1", "a.png"), attach("7-2", "b.png")];
-        assert_eq!(quoted_names(&items, Some(NAMES_IN_ERROR)), "\"a.png\", \"b.png\"");
+        assert_eq!(
+            quoted_names(&items, Some(NAMES_IN_ERROR)),
+            "\"a.png\", \"b.png\""
+        );
     }
 
     #[test]
     fn quoted_names_states_how_many_it_cut() {
-        let items: Vec<Value> =
-            (0..45).map(|i| attach(&format!("7-{i}"), &format!("f{i}.png"))).collect();
+        let items: Vec<Value> = (0..45)
+            .map(|i| attach(&format!("7-{i}"), &format!("f{i}.png")))
+            .collect();
         assert!(quoted_names(&items, Some(NAMES_IN_ERROR)).ends_with("… and 5 more"));
     }
 
@@ -1358,6 +1803,289 @@ mod tests {
         .expect("client builds")
     }
 
+    fn test_client(address: std::net::SocketAddr) -> Arc<YouTrack> {
+        YouTrack::new(Config {
+            base_url: format!("http://{address}"),
+            token: "t".into(),
+            timezone: chrono_tz::Europe::Moscow,
+            default_project: None,
+            holidays: Default::default(),
+            pre_holidays: Default::default(),
+            user_aliases: Default::default(),
+            download_dir: None,
+        })
+        .expect("client builds")
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Option<Value>) {
+        use std::io::Read;
+
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "request ended before its body");
+            request.extend_from_slice(&buffer[..read]);
+
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let body_start = header_end + 4;
+            if request.len() < body_start + content_length {
+                continue;
+            }
+
+            let body = (content_length > 0).then(|| {
+                serde_json::from_slice(&request[body_start..body_start + content_length]).unwrap()
+            });
+            return (headers.lines().next().unwrap().to_string(), body);
+        }
+    }
+
+    fn respond_json(stream: &mut std::net::TcpStream, body: &Value) {
+        use std::io::Write;
+
+        let body = serde_json::to_vec(body).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(&body).unwrap();
+    }
+
+    fn capture_issue_post() -> (
+        Arc<YouTrack>,
+        std::sync::mpsc::Receiver<Value>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (_, body) = read_request(&mut stream);
+            body_tx.send(body.unwrap()).unwrap();
+            respond_json(&mut stream, &json!({}));
+        });
+
+        (test_client(address), body_rx, server)
+    }
+
+    fn capture_custom_fields_post(
+        available: Value,
+    ) -> (
+        Arc<YouTrack>,
+        std::sync::mpsc::Receiver<Value>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (request_line, body) = read_request(&mut stream);
+            assert!(request_line.starts_with("GET /api/issues/ABC-1?"));
+            assert!(body.is_none());
+            respond_json(&mut stream, &json!({"customFields": available}));
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let (request_line, body) = read_request(&mut stream);
+            assert!(request_line.starts_with("POST /api/issues/ABC-1 "));
+            body_tx.send(body.unwrap()).unwrap();
+            respond_json(&mut stream, &json!({}));
+        });
+
+        (test_client(address), body_rx, server)
+    }
+
+    #[tokio::test]
+    async fn generated_api_operation_executes_typed_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (request_line, body) = read_request(&mut stream);
+            assert!(request_line.starts_with("POST /api/widgets/ABC%2D1?fields=id%2Cname HTTP/1.1"));
+            assert_eq!(body, Some(json!({"name":"updated"})));
+            respond_json(&mut stream, &json!({"id":"ABC-1","name":"updated"}));
+        });
+        let spec = json!({
+            "openapi":"3.0.1",
+            "paths":{
+                "/widgets/{id}":{
+                    "post":{
+                        "parameters":[
+                            {"name":"id","in":"path","required":true,"schema":{"type":"string"}},
+                            {"name":"fields","in":"query","schema":{"type":"string"}}
+                        ],
+                        "requestBody":{"required":true,"content":{"application/json":{
+                            "schema":{"type":"object","properties":{"name":{"type":"string"}}}
+                        }}},
+                        "responses":{"200":{"content":{"application/json":{
+                            "schema":{"type":"object"}
+                        }}}}
+                    }
+                }
+            }
+        });
+        let operation = crate::openapi::generate(&spec).unwrap().remove(0);
+        let args = serde_json::from_value(json!({
+            "id":"ABC-1",
+            "fields":"id,name",
+            "body":{"name":"updated"}
+        }))
+        .unwrap();
+
+        let response = test_client(address)
+            .execute_api_operation(&operation, args)
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        match response.body {
+            ApiResponseBody::Json(body) => {
+                assert_eq!(body, json!({"id":"ABC-1","name":"updated"}));
+            }
+            body => panic!("expected JSON response, got {body:?}"),
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_get_follows_binary_download_redirects() {
+        use std::io::Write;
+
+        let api_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_address = api_listener.local_addr().unwrap();
+        let file_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let file_address = file_listener.local_addr().unwrap();
+        let api_server = std::thread::spawn(move || {
+            let (mut stream, _) = api_listener.accept().unwrap();
+            let (request_line, body) = read_request(&mut stream);
+            assert_eq!(request_line, "GET /api/download HTTP/1.1");
+            assert!(body.is_none());
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://{file_address}/artifact\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let file_server = std::thread::spawn(move || {
+            let (mut stream, _) = file_listener.accept().unwrap();
+            let (request_line, body) = read_request(&mut stream);
+            assert_eq!(request_line, "GET /artifact HTTP/1.1");
+            assert!(body.is_none());
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 8\r\nConnection: close\r\n\r\nartifact",
+                )
+                .unwrap();
+        });
+        let spec = json!({
+            "openapi":"3.0.1",
+            "paths":{"/download":{"get":{"responses":{"200":{"content":{
+                "application/octet-stream":{"schema":{"type":"string","format":"binary"}}
+            }}}}}}
+        });
+        let operation = crate::openapi::generate(&spec).unwrap().remove(0);
+
+        let response = test_client(api_address)
+            .execute_api_operation(&operation, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert!(matches!(
+            response.body,
+            ApiResponseBody::Binary(base64)
+                if base64 == YouTrack::b64_encode(b"artifact")
+        ));
+        api_server.join().unwrap();
+        file_server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn null_assignee_posts_a_custom_field_clear() {
+        let (client, body_rx, server) = capture_issue_post();
+        let args: crate::model::IssueWrite =
+            serde_json::from_value(json!({"op":"update","id":"ABC-1","assignee":null})).unwrap();
+
+        assert!(client
+            .apply_side_effects("ABC-1", "ABC-1", &args)
+            .await
+            .unwrap());
+        assert_eq!(
+            body_rx.recv().unwrap(),
+            json!({"customFields":[{
+                "name":"Assignee",
+                "$type":"SingleUserIssueCustomField",
+                "value":null
+            }]})
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn arbitrary_custom_fields_resolve_types_and_post_values() {
+        let (client, body_rx, server) = capture_custom_fields_post(json!([
+            {"id":"92-1","name":"Type","$type":"SingleEnumIssueCustomField"},
+            {"id":"92-2","name":"Story points","$type":"SimpleIssueCustomField"},
+            {"id":"92-3","name":"Reviewers","$type":"MultiUserIssueCustomField"},
+            {"id":"92-4","name":"Estimate","$type":"PeriodIssueCustomField"}
+        ]));
+        let args: crate::model::IssueWrite = serde_json::from_value(json!({
+            "op":"update",
+            "id":"ABC-1",
+            "customFields":[
+                {"name":"Type","value":"Bug"},
+                {"name":"Story points","value":8},
+                {"name":"Reviewers","value":["alice","bob"]},
+                {"name":"Estimate","value":{"minutes":90}}
+            ]
+        }))
+        .unwrap();
+
+        assert!(client
+            .apply_side_effects("ABC-1", "ABC-1", &args)
+            .await
+            .unwrap());
+        assert_eq!(
+            body_rx.recv().unwrap(),
+            json!({"customFields":[
+                {
+                    "id":"92-1",
+                    "$type":"SingleEnumIssueCustomField",
+                    "value":{"name":"Bug"}
+                },
+                {
+                    "id":"92-2",
+                    "$type":"SimpleIssueCustomField",
+                    "value":8
+                },
+                {
+                    "id":"92-3",
+                    "$type":"MultiUserIssueCustomField",
+                    "value":[{"login":"alice"},{"login":"bob"}]
+                },
+                {
+                    "id":"92-4",
+                    "$type":"PeriodIssueCustomField",
+                    "value":{"minutes":90}
+                }
+            ]})
+        );
+        server.join().unwrap();
+    }
+
     #[test]
     fn attach_root_routes_issues_and_expands_bare_ids() {
         assert_eq!(
@@ -1377,7 +2105,13 @@ mod tests {
     #[test]
     fn entity_id_is_what_responses_should_echo() {
         // A caller passing "435" gets the resolved id back, not its shorthand.
-        assert_eq!(yt(Some("Culture")).entity_id(Entity::Issue, "435"), "Culture-435");
-        assert_eq!(yt(None).entity_id(Entity::Article, "Culture-A-81"), "Culture-A-81");
+        assert_eq!(
+            yt(Some("Culture")).entity_id(Entity::Issue, "435"),
+            "Culture-435"
+        );
+        assert_eq!(
+            yt(None).entity_id(Entity::Article, "Culture-A-81"),
+            "Culture-A-81"
+        );
     }
 }

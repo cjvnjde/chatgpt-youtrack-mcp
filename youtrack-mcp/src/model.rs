@@ -1,5 +1,14 @@
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
+fn deserialize_present_nullable_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +33,17 @@ pub enum IssueOp {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CustomFieldWrite {
+    /// Custom-field name.
+    pub name: String,
+    /// New value. Strings and string arrays are shorthand for named single-
+    /// and multi-value fields; API-native JSON objects are passed through.
+    /// null clears a single value; [] clears a multi-value field.
+    pub value: Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct IssueWrite {
     pub op: IssueOp,
     /// Issue id (required for update; bare number expanded via default project).
@@ -41,13 +61,17 @@ pub struct IssueWrite {
     /// Parent issue id for native subtask hierarchy. Empty string clears it.
     #[serde(default, rename = "parentId")]
     pub parent_id: Option<String>,
-    /// Assignee login.
-    #[serde(default)]
-    pub assignee: Option<String>,
+    /// Assignee login. Omit to leave unchanged; null clears the assignee.
+    #[serde(default, deserialize_with = "deserialize_present_nullable_string")]
+    pub assignee: Option<Option<String>>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub state: Option<String>,
+    /// Arbitrary issue custom fields. YouTrack field types are discovered from
+    /// the issue, so callers provide only each field name and new value.
+    #[serde(default, rename = "customFields")]
+    pub custom_fields: Option<Vec<CustomFieldWrite>>,
     /// Agile board name or id (any language/casing).
     #[serde(default)]
     pub board: Option<String>,
@@ -372,4 +396,45 @@ pub struct AttachmentArg {
     /// a bearer-equivalent link and the bulk of the payload.
     #[serde(default)]
     pub verbose: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issue_assignee_distinguishes_omitted_null_and_login() {
+        let omitted: IssueWrite =
+            serde_json::from_value(serde_json::json!({"op":"update","id":"ABC-1"})).unwrap();
+        let cleared: IssueWrite =
+            serde_json::from_value(serde_json::json!({"op":"update","id":"ABC-1","assignee":null}))
+                .unwrap();
+        let assigned: IssueWrite = serde_json::from_value(
+            serde_json::json!({"op":"update","id":"ABC-1","assignee":"alice"}),
+        )
+        .unwrap();
+
+        assert_eq!(omitted.assignee, None);
+        assert_eq!(cleared.assignee, Some(None));
+        assert_eq!(assigned.assignee, Some(Some("alice".into())));
+    }
+
+    #[test]
+    fn issue_accepts_arbitrary_custom_fields() {
+        let issue: IssueWrite = serde_json::from_value(serde_json::json!({
+            "op":"update",
+            "id":"ABC-1",
+            "customFields":[
+                {"name":"Priority","value":"Critical"},
+                {"name":"Story points","value":8}
+            ]
+        }))
+        .unwrap();
+
+        let fields = issue.custom_fields.unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "Priority");
+        assert_eq!(fields[0].value, serde_json::json!("Critical"));
+        assert_eq!(fields[1].value, serde_json::json!(8));
+    }
 }

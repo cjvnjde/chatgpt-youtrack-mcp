@@ -35,10 +35,15 @@ impl Config {
             .ok()
             .and_then(|s| s.parse::<Tz>().ok())
             .unwrap_or(chrono_tz::Europe::Moscow);
-        let default_project = std::env::var("YOUTRACK_DEFAULT_PROJECT").ok().filter(|s| !s.is_empty());
-        let holidays = std::env::var("YOUTRACK_HOLIDAYS").map(|s| parse_dates(&s)).unwrap_or_default();
-        let pre_holidays =
-            std::env::var("YOUTRACK_PRE_HOLIDAYS").map(|s| parse_dates(&s)).unwrap_or_default();
+        let default_project = std::env::var("YOUTRACK_DEFAULT_PROJECT")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let holidays = std::env::var("YOUTRACK_HOLIDAYS")
+            .map(|s| parse_dates(&s))
+            .unwrap_or_default();
+        let pre_holidays = std::env::var("YOUTRACK_PRE_HOLIDAYS")
+            .map(|s| parse_dates(&s))
+            .unwrap_or_default();
         let user_aliases = std::env::var("YOUTRACK_USER_ALIASES")
             .map(|s| {
                 s.split(',')
@@ -49,7 +54,9 @@ impl Config {
                     .collect()
             })
             .unwrap_or_default();
-        let download_dir = std::env::var("YOUTRACK_DOWNLOAD_DIR").ok().filter(|s| !s.is_empty());
+        let download_dir = std::env::var("YOUTRACK_DOWNLOAD_DIR")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         Ok(Config {
             base_url,
@@ -75,7 +82,10 @@ impl Config {
 
     /// Map a configured alias to a real login, otherwise return the input.
     pub fn resolve_alias<'a>(&'a self, login: &'a str) -> &'a str {
-        self.user_aliases.get(login).map(|s| s.as_str()).unwrap_or(login)
+        self.user_aliases
+            .get(login)
+            .map(|s| s.as_str())
+            .unwrap_or(login)
     }
 }
 

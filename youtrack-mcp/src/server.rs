@@ -1,18 +1,21 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rmcp::handler::server::tool::{ToolRoute, ToolRouter};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use serde_json::Value;
 
 use crate::model::*;
+use crate::openapi::{self, ApiOperation};
 use crate::report;
 use crate::youtrack::{strip_url, Resolved, YouTrack, LIST_TOP};
 
 #[derive(Clone)]
 pub struct Server {
     yt: Arc<YouTrack>,
+    router: ToolRouter<Self>,
 }
 
 /// Drop `$type` discriminator keys YouTrack stamps on every object — pure
@@ -81,12 +84,69 @@ async fn fetch_openai_file(file: &OpenAiFile) -> Result<Vec<u8>, ErrorData> {
 
 #[tool_router]
 impl Server {
-    pub fn new(yt: Arc<YouTrack>) -> Self {
-        Self { yt }
+    pub async fn new(yt: Arc<YouTrack>) -> anyhow::Result<Self> {
+        let spec = if let Ok(path) = std::env::var("YOUTRACK_OPENAPI_PATH") {
+            let raw = tokio::fs::read_to_string(&path)
+                .await
+                .map_err(|error| anyhow::anyhow!("read YOUTRACK_OPENAPI_PATH {path:?}: {error}"))?;
+            serde_json::from_str(&raw)
+                .map_err(|error| anyhow::anyhow!("parse YOUTRACK_OPENAPI_PATH {path:?}: {error}"))?
+        } else {
+            yt.openapi_spec()
+                .await
+                .map_err(|error| anyhow::anyhow!("load YouTrack OpenAPI schema: {error}"))?
+        };
+        Self::from_openapi(yt, &spec)
     }
 
-    #[tool(description = "Create, update or delete an issue: summary, description, parentId (native subtask), assignee, tags (must exist), state, board/sprint. board+sprint resolve by name or id, any language/casing; a board exposes only its own sprints, so a wrong sprint errors with the valid sprint list for that board. op=delete is irreversible.")]
-    async fn issue_write(&self, Parameters(a): Parameters<IssueWrite>) -> Result<String, ErrorData> {
+    fn from_openapi(yt: Arc<YouTrack>, spec: &Value) -> anyhow::Result<Self> {
+        let operations = openapi::generate(spec)?;
+        let generated_count = operations.len();
+        let mut router = Self::tool_router();
+        for operation in operations {
+            let operation = Arc::new(operation);
+            let tool = operation.tool.clone();
+            router.add_route(Self::api_route(tool, operation));
+        }
+        tracing::info!(
+            generated_api_tools = generated_count,
+            total_tools = router.list_all().len(),
+            "loaded typed YouTrack API mirror"
+        );
+        Ok(Self { yt, router })
+    }
+
+    fn api_route(tool: rmcp::model::Tool, operation: Arc<ApiOperation>) -> ToolRoute<Self> {
+        ToolRoute::new_dyn(
+            tool,
+            move |context: rmcp::handler::server::tool::ToolCallContext<'_, Self>| {
+                let operation = operation.clone();
+                Box::pin(async move {
+                    let args = context.arguments.unwrap_or_default();
+                    let result = match context
+                        .service
+                        .yt
+                        .execute_api_operation(&operation, args)
+                        .await
+                    {
+                        Ok(response) => response.into_tool_result(),
+                        Err(error) => {
+                            CallToolResult::error(vec![ContentBlock::text(error.to_string())])
+                        }
+                    };
+                    Ok(result.into())
+                })
+            },
+        )
+    }
+
+    #[tool(
+        description = "Create, update or delete an issue: summary, description, parentId (native subtask), assignee (login; null clears), tags (must exist), state, customFields, board/sprint. customFields=[{name,value}] updates any issue custom field: strings/string arrays are shorthand for named single/multi values; null/[] clear; API-native JSON values pass through. Field types are discovered automatically. board+sprint resolve by name or id, any language/casing. op=delete is irreversible."
+    )]
+    async fn issue_write(
+        &self,
+        Parameters(a): Parameters<IssueWrite>,
+    ) -> Result<String, ErrorData> {
         let v = match a.op {
             IssueOp::Create => self.yt.issue_create(&a).await?,
             IssueOp::Update => self.yt.issue_update(&a).await?,
@@ -105,7 +165,10 @@ impl Server {
     }
 
     #[tool(description = "Search issues by YouTrack query. fields short|full.")]
-    async fn issue_search(&self, Parameters(a): Parameters<IssueSearch>) -> Result<String, ErrorData> {
+    async fn issue_search(
+        &self,
+        Parameters(a): Parameters<IssueSearch>,
+    ) -> Result<String, ErrorData> {
         let full = matches!(a.fields, Some(SearchFields::Full));
         ok(self
             .yt
@@ -118,7 +181,9 @@ impl Server {
         ok(self.yt.issue_links(&a.id).await?)
     }
 
-    #[tool(description = "Add or remove an issue link. role outward|inward for directed types. For parent/child use issue_write.parentId.")]
+    #[tool(
+        description = "Add or remove an issue link. role outward|inward for directed types. For parent/child use issue_write.parentId."
+    )]
     async fn link_write(&self, Parameters(a): Parameters<LinkWrite>) -> Result<String, ErrorData> {
         let inward = matches!(a.role, Some(LinkRole::Inward));
         let v = match a.op {
@@ -136,11 +201,19 @@ impl Server {
         ok(v)
     }
 
-    #[tool(description = "Create or update a comment on an issue or article (entity). op=update needs commentId.")]
-    async fn comment_write(&self, Parameters(a): Parameters<CommentWrite>) -> Result<String, ErrorData> {
+    #[tool(
+        description = "Create or update a comment on an issue or article (entity). op=update needs commentId."
+    )]
+    async fn comment_write(
+        &self,
+        Parameters(a): Parameters<CommentWrite>,
+    ) -> Result<String, ErrorData> {
         let comment_id = match a.op {
             WriteOp::Create => None,
-            WriteOp::Update => Some(req(&a.comment_id, "comment_write op=update requires 'commentId'")?),
+            WriteOp::Update => Some(req(
+                &a.comment_id,
+                "comment_write op=update requires 'commentId'",
+            )?),
         };
         ok(self
             .yt
@@ -156,12 +229,18 @@ impl Server {
     }
 
     #[tool(description = "List comments of an issue or article (entity).")]
-    async fn comments_list(&self, Parameters(a): Parameters<CommentsList>) -> Result<String, ErrorData> {
+    async fn comments_list(
+        &self,
+        Parameters(a): Parameters<CommentsList>,
+    ) -> Result<String, ErrorData> {
         ok(self.yt.comments_list(a.entity, &a.parent_id).await?)
     }
 
     #[tool(description = "Create or update a knowledge-base article.")]
-    async fn article_write(&self, Parameters(a): Parameters<ArticleWrite>) -> Result<String, ErrorData> {
+    async fn article_write(
+        &self,
+        Parameters(a): Parameters<ArticleWrite>,
+    ) -> Result<String, ErrorData> {
         let v = match a.op {
             WriteOp::Create => self.yt.article_create(&a).await?,
             WriteOp::Update => self.yt.article_update(&a).await?,
@@ -169,8 +248,13 @@ impl Server {
         ok(v)
     }
 
-    #[tool(description = "Get an article by id (op get) or list articles (op list, optional query).")]
-    async fn article_get(&self, Parameters(a): Parameters<ArticleGet>) -> Result<String, ErrorData> {
+    #[tool(
+        description = "Get an article by id (op get) or list articles (op list, optional query)."
+    )]
+    async fn article_get(
+        &self,
+        Parameters(a): Parameters<ArticleGet>,
+    ) -> Result<String, ErrorData> {
         let v = match a.op {
             GetOp::Get => {
                 self.yt
@@ -182,13 +266,21 @@ impl Server {
         ok(v)
     }
 
-    #[tool(description = "Create/update/delete a time-tracking work item. type = work item type name/id. idempotent skips duplicates.")]
-    async fn workitem_write(&self, Parameters(a): Parameters<WorkitemWrite>) -> Result<String, ErrorData> {
+    #[tool(
+        description = "Create/update/delete a time-tracking work item. type = work item type name/id. idempotent skips duplicates."
+    )]
+    async fn workitem_write(
+        &self,
+        Parameters(a): Parameters<WorkitemWrite>,
+    ) -> Result<String, ErrorData> {
         let v = match a.op {
             WorkOp::Create => self.yt.workitem_create(&a).await?,
             WorkOp::Update => self.yt.workitem_update(&a).await?,
             WorkOp::Delete => {
-                let wid = req(&a.work_item_id, "workitem_write op=delete requires 'workItemId'")?;
+                let wid = req(
+                    &a.work_item_id,
+                    "workitem_write op=delete requires 'workItemId'",
+                )?;
                 self.yt.workitem_delete(&a.issue_id, wid).await?
             }
         };
@@ -196,7 +288,10 @@ impl Server {
     }
 
     #[tool(description = "List/aggregate work items by author and date range.")]
-    async fn workitems_list(&self, Parameters(a): Parameters<WorkitemsList>) -> Result<String, ErrorData> {
+    async fn workitems_list(
+        &self,
+        Parameters(a): Parameters<WorkitemsList>,
+    ) -> Result<String, ErrorData> {
         ok(self
             .yt
             .workitems_list(
@@ -210,9 +305,17 @@ impl Server {
             .await?)
     }
 
-    #[tool(description = "Per-day expected-vs-actual worktime report (480m/day, skips weekends/holidays).")]
-    async fn workitems_report(&self, Parameters(a): Parameters<WorkitemsReport>) -> Result<String, ErrorData> {
-        ok(report::workitems_report(&self.yt, a.author.as_deref(), &a.start_date, &a.end_date).await?)
+    #[tool(
+        description = "Per-day expected-vs-actual worktime report (480m/day, skips weekends/holidays)."
+    )]
+    async fn workitems_report(
+        &self,
+        Parameters(a): Parameters<WorkitemsReport>,
+    ) -> Result<String, ErrorData> {
+        ok(
+            report::workitems_report(&self.yt, a.author.as_deref(), &a.start_date, &a.end_date)
+                .await?,
+        )
     }
 
     #[tool(description = "Users: op list (optional query) | me | get (by id).")]
@@ -229,7 +332,9 @@ impl Server {
         ok(v)
     }
 
-    #[tool(description = "Discovery: kind projects | link_types | work_item_types (optional project).")]
+    #[tool(
+        description = "Discovery: kind projects | link_types | work_item_types (optional project)."
+    )]
     async fn meta(&self, Parameters(a): Parameters<MetaArg>) -> Result<String, ErrorData> {
         let v = match a.kind {
             MetaKind::Projects => self.yt.meta_projects().await?,
@@ -239,7 +344,9 @@ impl Server {
         ok(v)
     }
 
-    #[tool(description = "Activity feed. scope=issue (needs issueId, optional author) | user (needs author, defaults last 30d). categories default CustomFieldCategory,CommentsCategory. Dates ISO or unix ms.")]
+    #[tool(
+        description = "Activity feed. scope=issue (needs issueId, optional author) | user (needs author, defaults last 30d). categories default CustomFieldCategory,CommentsCategory. Dates ISO or unix ms."
+    )]
     async fn activity(&self, Parameters(a): Parameters<ActivityArg>) -> Result<String, ErrorData> {
         let cats = a.categories.as_deref();
         let top = a.top.unwrap_or(100);
@@ -286,12 +393,16 @@ impl Server {
         Parameters(a): Parameters<AttachmentUploadArg>,
     ) -> Result<CallToolResult, ErrorData> {
         let entity = a.entity.unwrap_or(Entity::Issue);
-        let name = a.name.as_deref().or(a.file.file_name.as_deref()).ok_or_else(|| {
-            ErrorData::invalid_params(
-                "attachment_upload requires 'name' when the file has no file_name",
-                None,
-            )
-        })?;
+        let name = a
+            .name
+            .as_deref()
+            .or(a.file.file_name.as_deref())
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "attachment_upload requires 'name' when the file has no file_name",
+                    None,
+                )
+            })?;
         let bytes = fetch_openai_file(&a.file).await?;
         let mut v = self
             .yt
@@ -303,7 +414,9 @@ impl Server {
         ok_result(v)
     }
 
-    #[tool(description = "List, inspect, download, or delete attachments on an issue (default) or article: op list|get|download|delete. This tool cannot upload; use attachment_upload for every upload. Target get/download/delete by 'attachmentId' or 'name'.")]
+    #[tool(
+        description = "List, inspect, download, or delete attachments on an issue (default) or article: op list|get|download|delete. This tool cannot upload; use attachment_upload for every upload. Target get/download/delete by 'attachmentId' or 'name'."
+    )]
     async fn attachment(
         &self,
         Parameters(a): Parameters<AttachmentArg>,
@@ -313,7 +426,11 @@ impl Server {
         let parent = a.parent_id.as_str();
         let top = a.top.unwrap_or(LIST_TOP).max(1);
         let v = match a.op {
-            AttachOp::List => self.yt.attachments_list(entity, parent, top, verbose).await?,
+            AttachOp::List => {
+                self.yt
+                    .attachments_list(entity, parent, top, verbose)
+                    .await?
+            }
             AttachOp::Get => {
                 let r = self.resolve(entity, parent, &a, top).await?;
                 let mut v = self.yt.attachment_meta(entity, parent, r).await?;
@@ -326,7 +443,9 @@ impl Server {
                 let r = self.resolve(entity, parent, &a, top).await?;
                 let meta = self.yt.attachment_meta(entity, parent, r).await?;
                 let (name, mime, bytes) = self.yt.attachment_download(&meta).await?;
-                return self.deliver_download(a.path.as_deref(), name, mime, bytes).await;
+                return self
+                    .deliver_download(a.path.as_deref(), name, mime, bytes)
+                    .await;
             }
             AttachOp::Delete => {
                 let r = self.resolve(entity, parent, &a, top).await?;
@@ -355,13 +474,22 @@ impl Server {
     ) -> Result<Resolved, ErrorData> {
         if a.attachment_id.is_none() && a.name.is_none() {
             return Err(ErrorData::invalid_params(
-                format!("attachment op={} requires 'attachmentId' or 'name'", a.op.as_str()),
+                format!(
+                    "attachment op={} requires 'attachmentId' or 'name'",
+                    a.op.as_str()
+                ),
                 None,
             ));
         }
         Ok(self
             .yt
-            .attachment_resolve(entity, parent, a.attachment_id.as_deref(), a.name.as_deref(), top)
+            .attachment_resolve(
+                entity,
+                parent,
+                a.attachment_id.as_deref(),
+                a.name.as_deref(),
+                top,
+            )
             .await?)
     }
 
@@ -377,8 +505,7 @@ impl Server {
         bytes: Vec<u8>,
     ) -> Result<CallToolResult, ErrorData> {
         if should_inline_image(requested_path.is_some(), &mime, bytes.len()) {
-            let summary =
-                serde_json::json!({"name": name, "bytes": bytes.len(), "mimeType": mime});
+            let summary = serde_json::json!({"name": name, "bytes": bytes.len(), "mimeType": mime});
             return Ok(CallToolResult::success(vec![
                 ContentBlock::text(ok(summary)?),
                 ContentBlock::image(YouTrack::b64_encode(&bytes), mime),
@@ -407,9 +534,9 @@ impl Server {
                 dir.join(sanitize_file_name(&name))
             }
         };
-        tokio::fs::write(&path, &bytes)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("write {}: {e}", path.display()), None))?;
+        tokio::fs::write(&path, &bytes).await.map_err(|e| {
+            ErrorData::internal_error(format!("write {}: {e}", path.display()), None)
+        })?;
         ok_result(serde_json::json!({
             "saved": path.to_string_lossy(),
             "bytes": bytes.len(),
@@ -430,7 +557,13 @@ fn should_inline_image(explicit_path: bool, mime: &str, len: usize) -> bool {
 fn sanitize_file_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if std::path::is_separator(c) || c == '\0' { '_' } else { c })
+        .map(|c| {
+            if std::path::is_separator(c) || c == '\0' {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     if cleaned.trim().trim_matches('.').is_empty() {
         return "attachment".to_string();
@@ -439,11 +572,12 @@ fn sanitize_file_name(name: &str) -> String {
 }
 
 #[tool_handler(
+    router = self.router,
     name = "youtrack-mcp",
     // `version` deliberately omitted: the macro then reports CARGO_PKG_VERSION.
     // It used to be hardcoded and drifted to 0.1.0 while the crate was at 0.1.3,
     // so the handshake could not tell a client which build it had connected to.
-    instructions = "Lean YouTrack MCP. Conventions: issue ids are readable like ABC-123 (bare numbers expand via YOUTRACK_DEFAULT_PROJECT). For parent/child use issue_write.parentId (native subtask) — NOT link_write. link_write needs sourceId+targetId+linkType (name e.g. 'Relates','Depend') and role outward|inward for directed types. Dates are ISO YYYY-MM-DD. tags must already exist (this server never creates tags; unknown tag = error). issue_write op=delete permanently deletes the issue. workitem_write needs date+minutes (+type name like 'Разработка'); idempotent=true skips a same issue+date+description entry. workitems_list/report default to the current user. Errors are returned as JSON-RPC errors whose message states the missing/invalid field and the fix; 'YouTrack <status>: <msg>' means the API rejected the call."
+    instructions = "Complete typed YouTrack MCP. Every api_* tool mirrors one operation from the connected instance's /api/openapi.json; path/query/header/cookie parameters are top-level and request payloads use body. Generated tools include administrative and irreversible API operations, subject to YOUTRACK_TOKEN permissions. Curated-tool conventions: issue ids are readable like ABC-123 (bare numbers expand via YOUTRACK_DEFAULT_PROJECT). For parent/child use issue_write.parentId (native subtask) — NOT link_write. issue_write assignee=null clears the assignee. issue_write customFields=[{name,value}] updates arbitrary custom fields; use strings/string arrays for named single/multi values, null/[] to clear, or API-native JSON values. link_write needs sourceId+targetId+linkType (name e.g. 'Relates','Depend') and role outward|inward for directed types. Dates are ISO YYYY-MM-DD. tags must already exist (curated tools never create tags; unknown tag = error). issue_write op=delete permanently deletes the issue. workitem_write needs date+minutes (+type name like 'Разработка'); idempotent=true skips a same issue+date+description entry. workitems_list/report default to the current user. Errors state the missing/invalid field or return 'YouTrack <status>: <msg>' when the API rejected the call."
 )]
 impl ServerHandler for Server {}
 
@@ -457,7 +591,10 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "attachment_upload"));
 
         let tool = serde_json::to_value(Server::attachment_upload_tool_attr()).unwrap();
-        assert_eq!(tool["_meta"]["openai/fileParams"], serde_json::json!(["file"]));
+        assert_eq!(
+            tool["_meta"]["openai/fileParams"],
+            serde_json::json!(["file"])
+        );
 
         let schema = &tool["inputSchema"];
         assert!(schema["required"]
@@ -491,6 +628,71 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<AttachmentArg>(args).is_err());
+    }
+
+    fn schema_permits_null(schema: &Value) -> bool {
+        match schema {
+            Value::String(value) => value == "null",
+            Value::Array(values) => values.iter().any(schema_permits_null),
+            Value::Object(values) => values.values().any(schema_permits_null),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn issue_write_schema_exposes_arbitrary_custom_fields_and_nullable_assignee() {
+        let tool = serde_json::to_value(Server::issue_write_tool_attr()).unwrap();
+        let schema = &tool["inputSchema"];
+        let properties = &schema["properties"];
+
+        assert!(properties["customFields"].is_object());
+        assert!(properties["type"].is_null());
+        assert!(schema_permits_null(&properties["assignee"]));
+        assert_eq!(
+            schema["$defs"]["CustomFieldWrite"]["required"],
+            serde_json::json!(["name", "value"])
+        );
+    }
+
+    #[test]
+    fn registers_every_generated_operation_beside_curated_tools() {
+        let yt = YouTrack::new(crate::config::Config {
+            base_url: "http://yt.invalid".into(),
+            token: "t".into(),
+            timezone: chrono_tz::Europe::Moscow,
+            default_project: None,
+            holidays: Default::default(),
+            pre_holidays: Default::default(),
+            user_aliases: Default::default(),
+            download_dir: None,
+        })
+        .unwrap();
+        let spec = serde_json::json!({
+            "openapi":"3.0.1",
+            "paths":{
+                "/widgets":{
+                    "get":{"responses":{"200":{"content":{"application/json":{
+                        "schema":{"type":"array","items":{"type":"object"}}
+                    }}}}},
+                    "post":{"requestBody":{"content":{"application/json":{
+                        "schema":{"type":"object","properties":{"name":{"type":"string"}}}
+                    }}},"responses":{"200":{"description":"updated"}}}
+                }
+            }
+        });
+
+        let server = Server::from_openapi(yt, &spec).unwrap();
+        let tools = server.router.list_all();
+        assert!(tools.iter().any(|tool| tool.name == "issue_write"));
+        assert!(tools.iter().any(|tool| tool.name == "api_get_widgets"));
+        assert!(tools.iter().any(|tool| tool.name == "api_post_widgets"));
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool.name.starts_with("api_"))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -556,7 +758,11 @@ mod tests {
 
     #[test]
     fn does_not_inline_an_oversized_image() {
-        assert!(!should_inline_image(false, "image/png", INLINE_IMAGE_MAX + 1));
+        assert!(!should_inline_image(
+            false,
+            "image/png",
+            INLINE_IMAGE_MAX + 1
+        ));
     }
 
     #[test]

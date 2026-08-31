@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Added MCP Streamable HTTP transport for shared deployments. Public
+  `MCP_HTTP_ADDR` requests require a 32+ byte `MCP_AUTH_TOKEN`; optional
+  `MCP_INTERNAL_ADDR` provides a separate unauthenticated listener for a
+  private tunnel network. Stdio remains the default.
+- Added private `/healthz` and `/readyz` endpoints to the public listener for
+  container orchestration.
+- Added a complete typed MCP mirror of the connected YouTrack API. At startup,
+  every operation in `/api/openapi.json` is registered as an `api_*` tool with
+  typed parameters, request body and response schema; JSON, form, multipart,
+  text and binary bodies are supported.
+- Added `YOUTRACK_OPENAPI_PATH` for offline or pinned OpenAPI schemas.
+- `issue_write.assignee` now distinguishes omission from `null`; explicit `null`
+  clears the current assignee.
+- Added `issue_write.customFields` for changing arbitrary issue custom fields,
+  including Type. Field types are discovered automatically; common named values
+  have string shorthands, while API-native JSON supports every other type.
+
 ## 0.2.0
 
 - Added `attachment_upload`, a dedicated ChatGPT file-input tool that downloads

@@ -22,9 +22,10 @@ impl From<AppError> for ErrorData {
     fn from(e: AppError) -> Self {
         match e {
             AppError::Bad(m) => ErrorData::invalid_params(m, None),
-            AppError::Api { status: 404, message } => {
-                ErrorData::resource_not_found(format!("YouTrack 404: {message}"), None)
-            }
+            AppError::Api {
+                status: 404,
+                message,
+            } => ErrorData::resource_not_found(format!("YouTrack 404: {message}"), None),
             other => ErrorData::internal_error(other.to_string(), None),
         }
     }

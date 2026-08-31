@@ -1,6 +1,8 @@
 mod config;
 mod error;
+mod http_transport;
 mod model;
+mod openapi;
 mod report;
 mod server;
 mod youtrack;
@@ -26,7 +28,15 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::from_env()?;
     let yt = YouTrack::new(cfg)?;
-    let service = Server::new(yt).serve(stdio()).await?;
-    service.waiting().await?;
+    let server = Server::new(yt).await?;
+    let transport = std::env::var("MCP_TRANSPORT").unwrap_or_else(|_| "stdio".into());
+    match transport.trim().to_ascii_lowercase().as_str() {
+        "stdio" => {
+            let service = server.serve(stdio()).await?;
+            service.waiting().await?;
+        }
+        "http" => http_transport::serve(server, http_transport::HttpConfig::from_env()?).await?,
+        other => anyhow::bail!("unsupported MCP_TRANSPORT {other:?}; expected stdio or http"),
+    }
     Ok(())
 }
